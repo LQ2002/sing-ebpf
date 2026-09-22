@@ -12,6 +12,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 
 	CiliumEBPF "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 )
@@ -185,6 +186,33 @@ type mapSpecOverride struct {
 	flags      uint32
 }
 
+// describeLocalStorageTypes attaches BTF type information to a socket local
+// storage map spec.
+//
+// The kernel refuses to create a local storage map without btf_key_type_id and
+// btf_value_type_id -- it returns EINVAL, with nothing naming BTF as the reason.
+// The compiled objects cannot supply them: the maps are declared with the legacy
+// struct bpf_map_def, and the generate target in Makefile runs llvm-objcopy to
+// strip .BTF and .BTF.ext from every object afterwards. So the types are
+// synthesised here from the sizes the object already carries.
+//
+// The key is always a 4-byte integer, which is the file descriptor userspace
+// passes; the kernel checks that size explicitly. The value is described as a
+// byte array rather than an integer because it is not always scalar -- the UDP
+// flow storage holds a 52 byte struct -- and for local storage the kernel only
+// needs the size to agree.
+func describeLocalStorageTypes(mapSpec *CiliumEBPF.MapSpec) {
+	mapSpec.KeySize = 4
+	mapSpec.Key = &btf.Int{Name: "__u32", Size: 4, Encoding: btf.Unsigned}
+	mapSpec.Value = &btf.Array{
+		// Index must be set even though nothing indexes this array: the BTF
+		// encoder walks it and panics on a nil type.
+		Index:  &btf.Int{Name: "__u32", Size: 4, Encoding: btf.Unsigned},
+		Type:   &btf.Int{Name: "__u8", Size: 1, Encoding: btf.Unsigned},
+		Nelems: mapSpec.ValueSize,
+	}
+}
+
 func loadObjectMaps(
 	loadSpec func() (*CiliumEBPF.CollectionSpec, error),
 	overrides map[string]mapSpecOverride,
@@ -200,7 +228,8 @@ func loadObjectMaps(
 			delete(spec.Maps, name)
 			continue
 		}
-		if override.name == "" || override.mapType == CiliumEBPF.UnspecifiedMap || override.maxEntries == 0 {
+		if override.name == "" || override.mapType == CiliumEBPF.UnspecifiedMap ||
+			(override.maxEntries == 0 && override.mapType != CiliumEBPF.SkStorage) {
 			return nil, E.New("invalid eBPF map override for ", name)
 		}
 		mapSpec.Name = override.name
@@ -208,6 +237,9 @@ func loadObjectMaps(
 		mapSpec.MaxEntries = override.maxEntries
 		mapSpec.Flags = override.flags
 		mapSpec.Extra = nil
+		if override.mapType == CiliumEBPF.SkStorage {
+			describeLocalStorageTypes(mapSpec)
+		}
 	}
 	for name := range overrides {
 		if spec.Maps[name] == nil {
