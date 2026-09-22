@@ -231,7 +231,22 @@ MAP(tc_control, __u32, struct sb_tc_control, BPF_MAP_TYPE_ARRAY, 1U);
 MAP(tc_listener_sockets, __u32, __u32, BPF_MAP_TYPE_SOCKMAP, SB_TC_LISTENER_COUNT);
 MAP(tc_assignment, struct sb_tc_assign_key, struct sb_tc_assign_value, BPF_MAP_TYPE_LRU_HASH, 65536U);
 MAP(tc_stats, __u32, __u64, BPF_MAP_TYPE_PERCPU_ARRAY, SB_TC_STAT_COUNT);
-MAP(tc_self_sockets, __u64, __u32, BPF_MAP_TYPE_LRU_HASH, 65536U);
+// tc_self_sockets 不是普通哈希表，而是挂在 socket 本身上的本地存储。
+// 这样做的理由是回收：按 socket cookie 索引的哈希表没有任何东西在 socket
+// 关闭时删除对应条目（用户态注册路径尤其如此，见 internal/core/self_bypass.go
+// 的 RegisterSocket），只能靠 LRU 淘汰兜底，于是一条长连接的 cookie 可能在
+// socket 还活着的时候被新条目挤掉，下一个包就重新落进拦截路径。本地存储随
+// socket 释放自动回收，这一类问题从根上不存在。
+//
+// 老式 bpf_map_def 就能声明这种 map（key_size 与 max_entries 必须为 0），
+// 不需要 BTF 式的 map 定义——这一点很关键，因为构建流程会用 llvm-objcopy
+// 把 .BTF 段从对象里剥掉，见 Makefile 的 generate 目标。
+struct bpf_map_def SEC("maps") tc_self_sockets = {
+    .type = BPF_MAP_TYPE_SK_STORAGE,
+    .key_size = 0U,
+    .value_size = sizeof(__u32),
+    .max_entries = 0U,
+};
 MAP(tc_uid_policy, struct sb_tc_uid_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 4096U);
 MAP(tc_local_bypass_ipv4, struct sb_tc_ipv4_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 65536U);
 MAP(tc_local_bypass_ipv6, struct sb_tc_ipv6_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE, 65536U);
@@ -266,6 +281,8 @@ static struct bpf_sock *(*sk_lookup_udp)(void *ctx, struct bpf_sock_tuple *tuple
 static long (*sk_assign)(void *ctx, struct bpf_sock *socket, __u64 flags) =
     (void *)BPF_FUNC_sk_assign;
 static void (*sk_release)(struct bpf_sock *socket) = (void *)BPF_FUNC_sk_release;
+static void *(*sk_storage_get)(void *map, void *socket, void *value, __u64 flags) =
+    (void *)BPF_FUNC_sk_storage_get;
 
 INLINE void increment_stat(__u32 index) {
     if (index >= SB_TC_STAT_COUNT) return;
@@ -322,9 +339,13 @@ INLINE bool uid_bypassed(struct __sk_buff *skb, const struct sb_tc_control *cont
     return (control->flags & SB_TC_FLAG_UID_DEFAULT_BYPASS) != 0U ? !matched : matched;
 }
 
-INLINE __u32 socket_metadata(__u64 socket_cookie) {
-    if (socket_cookie == 0U) return 0U;
-    __u32 *metadata = map_lookup(&tc_self_sockets, &socket_cookie);
+// skb->sk 的 verifier 类型是 sock_common_or_null，必须先判空才能传给
+// helper，否则加载时报 "R2 type=sock_common_or_null expected=sock_common"。
+// 本机出站路径上 skb->sk 通常是有的——同一处原本就在调 bpf_get_socket_cookie，
+// 那个 helper 同样依赖 skb->sk——但转发和无主流量会走到空指针分支。
+INLINE __u32 socket_metadata(struct __sk_buff *skb) {
+    if (skb->sk == 0) return 0U;
+    __u32 *metadata = sk_storage_get(&tc_self_sockets, skb->sk, 0, 0U);
     return metadata != 0 ? *metadata : 0U;
 }
 
@@ -819,8 +840,10 @@ INLINE int local_egress_mark(struct __sk_buff *skb, bool ethernet, bool track_pr
     const struct sb_tc_control *control = load_control();
     if (control == 0 || control->enabled == 0U || control->delivery_ifindex == 0U) return TC_ACT_UNSPEC;
     if (skb->ingress_ifindex != 0U) return TC_ACT_UNSPEC;
-    __u64 socket_cookie = get_socket_cookie(skb);
-    __u32 socket_metadata_value = socket_metadata(socket_cookie);
+    // socket cookie 仍然要读，但只为了进程追踪把它记进 tc_assignment；
+    // 自绕过的判定已经不再经过 cookie。
+    __u64 socket_cookie = track_process ? get_socket_cookie(skb) : 0U;
+    __u32 socket_metadata_value = socket_metadata(skb);
     if ((socket_metadata_value & SB_EBPF_SOCKET_METADATA_SELF_BYPASS) != 0U) return TC_ACT_UNSPEC;
     struct sb_tc_assign_key key;
     __u8 source_mac[6];

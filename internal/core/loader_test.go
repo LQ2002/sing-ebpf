@@ -178,31 +178,44 @@ func TestTCLocalProgramsDoNotUseTGIDHelper(t *testing.T) {
 	}
 }
 
-func TestTCLocalProgramsUseSocketCookieHelper(t *testing.T) {
+func programCallsHelper(program *CiliumEBPF.ProgramSpec, helper asm.BuiltinFunc) bool {
+	for _, instruction := range program.Instructions {
+		if instruction.IsBuiltinCall() && asm.BuiltinFunc(instruction.Constant) == helper {
+			return true
+		}
+	}
+	return false
+}
+
+// TestTCLocalProgramsReadSelfBypassStorage pins down which helper each local
+// egress program reaches for, because the two are no longer the same question.
+// Recognising sing-box's own sockets is socket local storage and every variant
+// must do it, or the proxy's own traffic gets intercepted and loops. Reading the
+// socket cookie is now only about recording the owner into tc_assignment, which
+// is what the process-tracking variants exist for, so the plain marking variants
+// must not pay for it.
+func TestTCLocalProgramsReadSelfBypassStorage(t *testing.T) {
 	spec, err := loadTC()
 	if err != nil {
 		t.Fatal(err)
 	}
+	// section -> whether it should also read the socket cookie
 	sections := map[string]bool{
-		"classifier/local_egress_ethernet_mark":    true,
-		"classifier/local_egress_raw_ip_mark":      true,
+		"classifier/local_egress_ethernet_mark":    false,
+		"classifier/local_egress_raw_ip_mark":      false,
 		"classifier/local_egress_ethernet_process": true,
 		"classifier/local_egress_raw_ip_process":   true,
 	}
 	for _, program := range spec.Programs {
-		expected, selected := sections[program.SectionName]
+		wantCookie, selected := sections[program.SectionName]
 		if !selected {
 			continue
 		}
-		found := false
-		for _, instruction := range program.Instructions {
-			if instruction.IsBuiltinCall() && asm.BuiltinFunc(instruction.Constant) == asm.FnGetSocketCookie {
-				found = true
-				break
-			}
+		if !programCallsHelper(program, asm.FnSkStorageGet) {
+			t.Errorf("section %q does not read self-bypass socket storage", program.SectionName)
 		}
-		if found != expected {
-			t.Errorf("section %q socket-cookie helper=%v, want %v", program.SectionName, found, expected)
+		if gotCookie := programCallsHelper(program, asm.FnGetSocketCookie); gotCookie != wantCookie {
+			t.Errorf("section %q socket-cookie helper=%v, want %v", program.SectionName, gotCookie, wantCookie)
 		}
 		delete(sections, program.SectionName)
 	}
@@ -252,11 +265,13 @@ func TestCgroupReleaseNotificationUsesRingBufferHelper(t *testing.T) {
 
 func TestEmbeddedTCObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadTC, map[string]objectMapLayout{
-		"tc_control":             {4, 72},
-		"tc_listener_sockets":    {4, 4},
-		"tc_assignment":          {44, 24},
-		"tc_stats":               {4, 8},
-		"tc_self_sockets":        {8, 4},
+		"tc_control":          {4, 72},
+		"tc_listener_sockets": {4, 4},
+		"tc_assignment":       {44, 24},
+		"tc_stats":            {4, 8},
+		// Socket local storage carries no key of its own: the socket is the
+		// key, so the kernel reports a key size of zero.
+		"tc_self_sockets":        {0, 4},
 		"tc_uid_policy":          {8, 1},
 		"tc_local_bypass_ipv4":   {8, 1},
 		"tc_local_bypass_ipv6":   {20, 1},
