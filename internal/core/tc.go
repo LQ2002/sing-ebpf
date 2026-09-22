@@ -124,6 +124,7 @@ type tcControl struct {
 	ForceInterceptIPv4Mask   [4]byte
 	ForceInterceptIPv6Prefix [16]byte
 	ForceInterceptIPv6Mask   [16]byte
+	PolicyGeneration         uint32
 }
 
 type tcAssignKey struct {
@@ -236,6 +237,9 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		// workaround the LRU version needed is gone too.
 		mapOverrides["tc_self_sockets"] = mapSpecOverride{
 			name: "sb_self_sockets", mapType: CiliumEBPF.SkStorage, maxEntries: 0, flags: bpfFlagNoPrealloc,
+		}
+		mapOverrides["tc_local_verdict"] = mapSpecOverride{
+			name: "sb_tc_verdict", mapType: CiliumEBPF.SkStorage, maxEntries: 0, flags: bpfFlagNoPrealloc,
 		}
 	}
 	legacyTCP := forceLegacyTCP || !config.EnableTCP
@@ -484,7 +488,26 @@ func (b *TCBackend) invalidateLocked(operation string, cause error) error {
 	return E.Errors(cause, disableErr, rebuildRequired)
 }
 
+// updateControlLocked writes the control value, and is the single place the
+// policy generation advances.
+//
+// That works because every mutation of TC policy already ends here: the flag
+// changes obviously do, and so do the two map-backed policies, because
+// UpdateCompiledBypassCIDR and UpdateHostAddresses both set flags alongside
+// their map writes and call this afterwards. UID and port policy cannot change
+// without rebuilding the backend, which creates a fresh verdict map anyway. So
+// bumping here invalidates every cached verdict on every policy change, and no
+// caller has to remember to do it.
+//
+// Zero is reserved to mean "no cached verdict", so the counter skips it on
+// wrap. Missing a bump would not fail loudly -- the classifier would keep
+// serving a verdict computed under the previous policy -- which is why the
+// invariant lives in one function instead of at each call site.
 func (b *TCBackend) updateControlLocked() error {
+	b.control.PolicyGeneration++
+	if b.control.PolicyGeneration == 0 {
+		b.control.PolicyGeneration = 1
+	}
 	key := uint32(0)
 	if err := updateMap(b.controlMapFD, unsafe.Pointer(&key), unsafe.Pointer(&b.control)); err != nil {
 		return eBPFOperationError("update TC eBPF control", err)

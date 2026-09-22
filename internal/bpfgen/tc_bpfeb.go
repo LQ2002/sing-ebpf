@@ -30,6 +30,7 @@ const (
 	TCMapTcIncludeSourceMac                     = "tc_include_source_mac"
 	TCMapTcListenerSockets                      = "tc_listener_sockets"
 	TCMapTcLocalBypassPort                      = "tc_local_bypass_port"
+	TCMapTcLocalVerdict                         = "tc_local_verdict"
 	TCMapTcSelfSockets                          = "tc_self_sockets"
 	TCMapTcSharedBypassPort                     = "tc_shared_bypass_port"
 	TCMapTcStats                                = "tc_stats"
@@ -124,6 +125,7 @@ type TCMapSpecs struct {
 	TcIncludeSourceMac  *ebpf.MapSpec `ebpf:"tc_include_source_mac"`
 	TcListenerSockets   *ebpf.MapSpec `ebpf:"tc_listener_sockets"`
 	TcLocalBypassPort   *ebpf.MapSpec `ebpf:"tc_local_bypass_port"`
+	TcLocalVerdict      *ebpf.MapSpec `ebpf:"tc_local_verdict"`
 	TcSelfSockets       *ebpf.MapSpec `ebpf:"tc_self_sockets"`
 	TcSharedBypassPort  *ebpf.MapSpec `ebpf:"tc_shared_bypass_port"`
 	TcStats             *ebpf.MapSpec `ebpf:"tc_stats"`
@@ -170,6 +172,7 @@ type TCMaps struct {
 	TcIncludeSourceMac  *ebpf.Map `ebpf:"tc_include_source_mac"`
 	TcListenerSockets   *ebpf.Map `ebpf:"tc_listener_sockets"`
 	TcLocalBypassPort   *ebpf.Map `ebpf:"tc_local_bypass_port"`
+	TcLocalVerdict      *ebpf.Map `ebpf:"tc_local_verdict"`
 	TcSelfSockets       *ebpf.Map `ebpf:"tc_self_sockets"`
 	TcSharedBypassPort  *ebpf.Map `ebpf:"tc_shared_bypass_port"`
 	TcStats             *ebpf.Map `ebpf:"tc_stats"`
@@ -192,6 +195,7 @@ func (m *TCMaps) Close() error {
 		m.TcIncludeSourceMac,
 		m.TcListenerSockets,
 		m.TcLocalBypassPort,
+		m.TcLocalVerdict,
 		m.TcSelfSockets,
 		m.TcSharedBypassPort,
 		m.TcStats,

@@ -179,6 +179,50 @@ func TestTCLocalProgramsReadSelfBypassStorage(t *testing.T) {
 	}
 }
 
+// TestTCLocalProgramsCacheTheirVerdict guards the wiring of the per-socket
+// verdict cache. Losing it would not fail anything: the classifier would simply
+// go back to running the whole policy chain -- including the LPM trie walk that
+// is the most expensive lookup in it -- on every packet of every flow, and the
+// only symptom would be CPU nobody is measuring.
+func TestTCLocalProgramsCacheTheirVerdict(t *testing.T) {
+	spec, err := loadTC()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Maps["tc_local_verdict"] == nil {
+		t.Fatal("TC object is missing the verdict cache map")
+	}
+	sections := []string{
+		"classifier/local_egress_ethernet_mark",
+		"classifier/local_egress_raw_ip_mark",
+		"classifier/local_egress_ethernet_process",
+		"classifier/local_egress_raw_ip_process",
+	}
+	for _, section := range sections {
+		var program *CiliumEBPF.ProgramSpec
+		for _, candidate := range spec.Programs {
+			if candidate.SectionName == section {
+				program = candidate
+				break
+			}
+		}
+		if program == nil {
+			t.Errorf("missing TC section %q", section)
+			continue
+		}
+		found := false
+		for _, instruction := range program.Instructions {
+			if instruction.Reference() == "tc_local_verdict" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("section %q does not reference the verdict cache", section)
+		}
+	}
+}
+
 func TestCgroupReleaseNotificationUsesRingBufferHelper(t *testing.T) {
 	spec, err := loadCgroup()
 	if err != nil {
@@ -220,13 +264,14 @@ func TestCgroupReleaseNotificationUsesRingBufferHelper(t *testing.T) {
 
 func TestEmbeddedTCObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadTC, map[string]objectMapLayout{
-		"tc_control":          {4, 72},
+		"tc_control":          {4, 76},
 		"tc_listener_sockets": {4, 4},
 		"tc_assignment":       {44, 24},
 		"tc_stats":            {4, 8},
 		// Socket local storage carries no key of its own: the socket is the
 		// key, so the kernel reports a key size of zero.
 		"tc_self_sockets":        {0, 4},
+		"tc_local_verdict":       {0, 8},
 		"tc_uid_policy":          {8, 1},
 		"tc_bypass_ipv4":         {8, 1},
 		"tc_bypass_ipv6":         {20, 1},
