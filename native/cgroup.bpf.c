@@ -39,7 +39,16 @@ MAP(cgroup_udp_recovery, struct sb_ebpf_listener_key, struct sb_ebpf_original_ds
 MAP(cgroup_udp_token, __u64, struct sb_ebpf_listener_key, BPF_MAP_TYPE_HASH);
 MAP(cgroup_udp_peer, struct sb_ebpf_udp_peer_key, struct sb_ebpf_udp_peer_value, BPF_MAP_TYPE_HASH);
 MAP(cgroup_udp_flow, struct sb_ebpf_udp_flow_key, struct sb_ebpf_udp_flow_value, BPF_MAP_TYPE_LRU_HASH);
-MAP(cgroup_socket_bypass, __u64, __u32, BPF_MAP_TYPE_LRU_HASH);
+// 与 tc.bpf.c 的 tc_self_sockets 是同一张 map：internal/core/cgroup_maps.go
+// 把用户态建好的那张克隆过来顶替这里。两边必须是同一种类型，所以这里也跟着
+// 改成 socket 本地存储；随之而来的好处是 release_socket_cookie 不再需要手动
+// 删除它，条目随 socket 释放自动消失。
+struct bpf_map_def SEC("maps") cgroup_socket_bypass = {
+    .type = BPF_MAP_TYPE_SK_STORAGE,
+    .key_size = 0U,
+    .value_size = sizeof(__u32),
+    .max_entries = 0U,
+};
 MAP(cgroup_uid_policy, struct sb_ebpf_uid_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
 MAP(cgroup_bypass_port, struct sb_ebpf_port_key, __u8, BPF_MAP_TYPE_HASH);
 MAP(cgroup_bypass_ipv4, struct sb_ebpf_ipv4_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
@@ -82,9 +91,11 @@ static __u64 (*get_current_uid_gid)(void) = (void *)BPF_FUNC_get_current_uid_gid
 static __u64 (*ktime_get_ns)(void) = (void *)BPF_FUNC_ktime_get_ns;
 static long (*ringbuf_output)(void *ringbuf, void *data, __u64 size, __u64 flags) =
     (void *)BPF_FUNC_ringbuf_output;
-#ifdef SB_EBPF_USE_SK_STORAGE
+// cgroup_socket_bypass 现在是 socket 本地存储，所以 sk_storage_get 在两种编译
+// 变体里都要有；sk_storage_delete 仍然只有 UDP 流存储那条路用得上。
 static void *(*sk_storage_get)(void *map, void *socket, void *value, __u64 flags) =
     (void *)BPF_FUNC_sk_storage_get;
+#ifdef SB_EBPF_USE_SK_STORAGE
 static long (*sk_storage_delete)(void *map, void *socket) =
     (void *)BPF_FUNC_sk_storage_delete;
 #endif
@@ -107,10 +118,11 @@ INLINE const struct sb_ebpf_cgroup_control *control(void) {
     __u32 key = 0U;
     return map_lookup(&cgroup_control, &key);
 }
-INLINE bool is_cookie_bypassed(void *ctx) {
-    __u64 cookie = get_socket_cookie(ctx);
-    if (cookie == 0U) return false;
-    __u32 *metadata = map_lookup(&cgroup_socket_bypass, &cookie);
+// 唯一的调用者 base_bypass 只从 sock_addr 程序进来，所以这里能直接取 ctx->sk；
+// 改签名而不是继续收 void* 是为了让 verifier 看得见 socket 指针的类型。
+INLINE bool is_socket_bypassed(struct bpf_sock_addr *ctx) {
+    if (ctx->sk == 0) return false;
+    __u32 *metadata = sk_storage_get(&cgroup_socket_bypass, ctx->sk, 0, 0U);
     return metadata != 0 &&
         (*metadata & SB_EBPF_SOCKET_METADATA_SELF_BYPASS) != 0U;
 }
@@ -173,9 +185,9 @@ INLINE bool host_ipv6(const __u32 address[4]) {
     return map_lookup(&cgroup_host_ipv6, &key) != 0;
 }
 
-INLINE bool base_bypass(void *ctx, const struct sb_ebpf_cgroup_control *config, __u8 protocol) {
+INLINE bool base_bypass(struct bpf_sock_addr *ctx, const struct sb_ebpf_cgroup_control *config, __u8 protocol) {
     if (!protocol_selected(config, protocol)) return true;
-    if (is_cookie_bypassed(ctx)) return true;
+    if (is_socket_bypassed(ctx)) return true;
     return false;
 }
 
@@ -937,7 +949,8 @@ INLINE int release_socket_cookie(__u64 cookie) {
         map_delete(&cgroup_udp_token, &cookie);
     }
     map_delete(&cgroup_udp_peer, &(__u64){cookie});
-    map_delete(&cgroup_socket_bypass, &cookie);
+    // cgroup_socket_bypass 是 socket 本地存储，条目随 socket 释放自动回收，
+    // 这里不再需要（也无法按 cookie）删除它。
     return 1;
 }
 
