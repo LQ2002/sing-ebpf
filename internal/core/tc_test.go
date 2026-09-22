@@ -9,7 +9,7 @@ import (
 )
 
 func TestTCABI(t *testing.T) {
-	if size := unsafe.Sizeof(tcControl{}); size != 72 {
+	if size := unsafe.Sizeof(tcControl{}); size != 76 {
 		t.Fatalf("unexpected TC control size: %d", size)
 	}
 	if offset := unsafe.Offsetof(tcControl{}.RoutingMark); offset != 12 {
