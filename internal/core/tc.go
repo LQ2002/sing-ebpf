@@ -229,14 +229,13 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		"tc_shared_bypass_port":  {name: "sb_tc_sport", mapType: CiliumEBPF.Hash, maxEntries: max(uint32(len(policy.sharedBypassPortEntries)), 1), flags: bpfFlagNoPrealloc},
 	}
 	if config.EnableLocal {
-		selfMapCapacity := uint32(selfBypassSocketCapacity)
-		if config.SelfBypassMap != nil {
-			// This map is replaced before programs are loaded. Avoid transiently
-			// allocating a second full-size LRU map during every backend rebuild.
-			selfMapCapacity = 1
-		}
+		// Socket local storage: no entry limit to set, because each entry is
+		// owned by the socket it hangs off and freed with it. The map created
+		// here is replaced by config.SelfBypassMap before the programs load, and
+		// creating an empty one costs nothing, so the transient-allocation
+		// workaround the LRU version needed is gone too.
 		mapOverrides["tc_self_sockets"] = mapSpecOverride{
-			name: "sb_self_sockets", mapType: CiliumEBPF.LRUHash, maxEntries: selfMapCapacity,
+			name: "sb_self_sockets", mapType: CiliumEBPF.SkStorage, maxEntries: 0, flags: bpfFlagNoPrealloc,
 		}
 	}
 	legacyTCP := forceLegacyTCP || !config.EnableTCP

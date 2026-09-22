@@ -13,9 +13,10 @@ import (
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
+	"github.com/cilium/ebpf/features"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -63,17 +64,61 @@ func NewSelfBypass() (*SelfBypass, error) {
 	return NewSelfBypassWithCapacity(selfBypassSocketCapacity)
 }
 
+// selfBypassStorageValue describes the map key and value to the kernel. Local
+// storage maps are BTF-only: the kernel refuses to create one without type
+// information, and the compiled objects have their .BTF section stripped by the
+// build (see the generate target in Makefile), so the types are supplied here
+// instead of being read back from the object.
+func selfBypassStorageValue() btf.Type {
+	return &btf.Int{Name: "__u32", Size: 4, Encoding: btf.Unsigned}
+}
+
+// requireSocketStorage reports whether this kernel can back the self-bypass map
+// with socket local storage. Both halves are needed: the map type itself, and
+// the lookup helper inside the TC classifier that reads it on every locally
+// originated packet.
+func requireSocketStorage() error {
+	if err := features.HaveMapType(CiliumEBPF.SkStorage); err != nil {
+		return E.Cause(err, "kernel does not provide BPF socket local storage")
+	}
+	if err := features.HaveProgramHelper(CiliumEBPF.SchedCLS, asm.FnSkStorageGet); err != nil {
+		return E.Cause(err, "kernel does not allow bpf_sk_storage_get in TC classifiers")
+	}
+	return nil
+}
+
+// NewSelfBypassWithCapacity creates the map that marks sing-box's own sockets.
+//
+// The capacity argument is kept for callers but no longer bounds anything: the
+// map is socket local storage, which has no entry limit because every entry is
+// owned by one socket and freed with it. That ownership is the whole point of
+// the type. The previous LRU hash was keyed by socket cookie and had nothing
+// deleting from it on the userspace registration path, so entries accumulated
+// until the LRU evicted them -- and an eviction could drop a cookie whose
+// socket was still alive and carrying a long-lived connection, which then
+// stopped being recognised as ours on its very next packet.
+//
+// Requires Linux 5.2 or newer. There is deliberately no fallback to the old
+// cookie map: this fork targets kernels well past that, and carrying two
+// on-wire layouts for the same map would mean two compiled object variants and
+// a runtime branch through every path that touches it.
 func NewSelfBypassWithCapacity(capacity uint32) (*SelfBypass, error) {
 	if capacity == 0 || capacity > MaxConfigurableMapCapacity {
 		return nil, E.New("invalid eBPF self-bypass socket map capacity: ", capacity)
 	}
+	if err := requireSocketStorage(); err != nil {
+		return nil, err
+	}
 	_ = raiseMemlockLimit()
 	sockets, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
 		Name:       "sb_self_sockets",
-		Type:       CiliumEBPF.LRUHash,
-		KeySize:    8,
+		Type:       CiliumEBPF.SkStorage,
+		KeySize:    4,
 		ValueSize:  4,
-		MaxEntries: capacity,
+		MaxEntries: 0,
+		Flags:      bpfFlagNoPrealloc,
+		Key:        selfBypassStorageValue(),
+		Value:      selfBypassStorageValue(),
 	})
 	if err != nil {
 		return nil, E.Cause(err, "create eBPF self-bypass socket map")
@@ -272,26 +317,45 @@ func newSelfBypassSocketAddrProgram(mapFD int, hook selfBypassSocketAddrHook) (*
 	return program, nil
 }
 
+// bpfLocalStorageCreate is BPF_LOCAL_STORAGE_GET_F_CREATE: allocate the entry
+// if this socket does not have one yet.
+const bpfLocalStorageCreate = 1
+
+// selfBypassCreateInstructions runs on cgroup/sock_create, where the context is
+// the struct bpf_sock itself, so it can be handed to the helper directly.
 func selfBypassCreateInstructions(mapFD int) asm.Instructions {
 	return asm.Instructions{
-		asm.FnGetSocketCookie.Call(),
-		asm.JEq.Imm(asm.R0, 0, "allow"),
-		asm.StoreMem(asm.RFP, -8, asm.R0, asm.DWord),
-		asm.StoreImm(asm.RFP, -12, 1, asm.Word),
+		asm.Mov.Reg(asm.R6, asm.R1),
+		asm.StoreImm(asm.RFP, -4, SocketMetadataSelfBypass, asm.Word),
 		asm.LoadMapPtr(asm.R1, mapFD),
-		asm.Mov.Reg(asm.R2, asm.RFP),
-		asm.Add.Imm(asm.R2, -8),
+		asm.Mov.Reg(asm.R2, asm.R6),
 		asm.Mov.Reg(asm.R3, asm.RFP),
-		asm.Add.Imm(asm.R3, -12),
-		asm.Mov.Imm(asm.R4, 0),
-		asm.FnMapUpdateElem.Call(),
-		asm.Mov.Imm(asm.R0, 1).WithSymbol("allow"),
+		asm.Add.Imm(asm.R3, -4),
+		asm.Mov.Imm(asm.R4, bpfLocalStorageCreate),
+		asm.FnSkStorageGet.Call(),
+		asm.Mov.Imm(asm.R0, 1),
 		asm.Return(),
 	}
 }
 
+// selfBypassReleaseInstructions runs on cgroup/sock_release. Socket local
+// storage is freed with the socket, so this only brings the release forward by
+// the length of the teardown; it is kept because dropping the hook would change
+// which attachment modes AttachCgroup can report (see attachCgroupSocket), and
+// an explicit delete documents the lifetime at the place it ends.
+//
+// socketCookieDeleteInstructions is deliberately not reused here any more: it
+// deletes by socket cookie, which is still right for the process-owner map in
+// process_tracker.go but no longer matches this map's key.
 func selfBypassReleaseInstructions(mapFD int) asm.Instructions {
-	return socketCookieDeleteInstructions(mapFD)
+	return asm.Instructions{
+		asm.Mov.Reg(asm.R6, asm.R1),
+		asm.LoadMapPtr(asm.R1, mapFD),
+		asm.Mov.Reg(asm.R2, asm.R6),
+		asm.FnSkStorageDelete.Call(),
+		asm.Mov.Imm(asm.R0, 1),
+		asm.Return(),
+	}
 }
 
 func socketCookieDeleteInstructions(mapFD int) asm.Instructions {
@@ -308,38 +372,44 @@ func socketCookieDeleteInstructions(mapFD int) asm.Instructions {
 	}
 }
 
+// sockAddrSocketOffset is offsetof(struct bpf_sock_addr, sk) from the kernel
+// UAPI headers. It is part of the stable BPF context layout, not something the
+// verifier will relocate, so it is written out rather than derived.
+const sockAddrSocketOffset = 64
+
+// selfBypassSocketAddrInstructions runs on the connect/sendmsg hooks, where the
+// context is a struct bpf_sock_addr and the socket hangs off it. Creating the
+// entry and setting the flag collapse into a single helper call: the value
+// passed in is only used when the entry did not exist yet, so the read-modify
+// -write that the cookie-keyed version needed is down to one OR on the pointer
+// the helper returns.
 func selfBypassSocketAddrInstructions(mapFD int) asm.Instructions {
 	return asm.Instructions{
-		asm.FnGetSocketCookie.Call(),
-		asm.JEq.Imm(asm.R0, 0, "allow"),
-		asm.StoreMem(asm.RFP, -8, asm.R0, asm.DWord),
+		asm.Mov.Reg(asm.R6, asm.R1),
+		asm.LoadMem(asm.R2, asm.R6, sockAddrSocketOffset, asm.DWord),
+		asm.JEq.Imm(asm.R2, 0, "allow"),
+		asm.StoreImm(asm.RFP, -4, SocketMetadataSelfBypass, asm.Word),
 		asm.LoadMapPtr(asm.R1, mapFD),
-		asm.Mov.Reg(asm.R2, asm.RFP),
-		asm.Add.Imm(asm.R2, -8),
-		asm.FnMapLookupElem.Call(),
-		asm.JEq.Imm(asm.R0, 0, "mark"),
-		asm.LoadMem(asm.R0, asm.R0, 0, asm.Word),
-		asm.Mov.Reg(asm.R5, asm.R0),
-		asm.And.Imm(asm.R5, SocketMetadataSelfBypass),
-		asm.JNE.Imm(asm.R5, 0, "allow"),
-		asm.Or.Imm(asm.R0, SocketMetadataSelfBypass),
-		asm.StoreMem(asm.RFP, -12, asm.R0, asm.Word),
-		asm.Ja.Label("update"),
-		asm.StoreImm(asm.RFP, -12, SocketMetadataSelfBypass, asm.Word).WithSymbol("mark"),
-		asm.LoadMapPtr(asm.R1, mapFD).WithSymbol("update"),
-		asm.Mov.Reg(asm.R2, asm.RFP),
-		asm.Add.Imm(asm.R2, -8),
 		asm.Mov.Reg(asm.R3, asm.RFP),
-		asm.Add.Imm(asm.R3, -12),
-		asm.Mov.Imm(asm.R4, 0),
-		asm.FnMapUpdateElem.Call(),
+		asm.Add.Imm(asm.R3, -4),
+		asm.Mov.Imm(asm.R4, bpfLocalStorageCreate),
+		asm.FnSkStorageGet.Call(),
+		asm.JEq.Imm(asm.R0, 0, "allow"),
+		asm.LoadMem(asm.R1, asm.R0, 0, asm.Word),
+		asm.Or.Imm(asm.R1, SocketMetadataSelfBypass),
+		asm.StoreMem(asm.R0, 0, asm.R1, asm.Word),
 		asm.Mov.Imm(asm.R0, 1).WithSymbol("allow"),
 		asm.Return(),
 	}
 }
 
 // RegisterSocket records a socket created by the consumer when cgroup hooks cannot
-// be attached. It performs one SO_COOKIE read and one map update per socket.
+// be attached. It performs one map update per socket.
+//
+// The key is the socket file descriptor itself: that is how userspace addresses
+// a socket local storage map. The SO_COOKIE read this used to need is gone with
+// it, and so is the question of who deletes the entry -- the kernel frees it
+// when the socket goes away.
 func (b *SelfBypass) RegisterSocket(rawConn syscall.RawConn) error {
 	if b == nil {
 		return nil
@@ -349,20 +419,11 @@ func (b *SelfBypass) RegisterSocket(rawConn syscall.RawConn) error {
 	if b.sockets == nil || b.CgroupAttached() {
 		return nil
 	}
-	var cookie uint64
+	value := uint32(SocketMetadataSelfBypass)
 	err := control.Raw(rawConn, func(fd uintptr) error {
-		var err error
-		cookie, err = unix.GetsockoptUint64(int(fd), unix.SOL_SOCKET, unix.SO_COOKIE)
-		return err
+		return b.sockets.Update(int32(fd), value, CiliumEBPF.UpdateAny)
 	})
 	if err != nil {
-		return E.Cause(err, "read socket cookie for eBPF self-bypass")
-	}
-	if cookie == 0 {
-		return E.New("socket returned an empty eBPF self-bypass cookie")
-	}
-	value := uint32(1)
-	if err = b.sockets.Update(&cookie, &value, CiliumEBPF.UpdateAny); err != nil {
 		return E.Cause(err, "register eBPF self-bypass socket")
 	}
 	return nil

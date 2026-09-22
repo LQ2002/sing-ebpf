@@ -70,21 +70,40 @@ func TestProcessCgroupExclusiveRejectsPopulatedDescendant(t *testing.T) {
 	}
 }
 
-func TestSelfBypassInstructionsUseSocketCookie(t *testing.T) {
-	for name, instructions := range map[string]asm.Instructions{
-		"create":      selfBypassCreateInstructions(1),
-		"release":     selfBypassReleaseInstructions(1),
-		"socket_addr": selfBypassSocketAddrInstructions(1),
+// TestSelfBypassInstructionsUseSocketStorage checks that every cgroup hook
+// addresses the map by socket rather than by socket cookie. Mixing the two would
+// not fail to load -- it would silently write entries the TC classifier never
+// finds -- so the helper each hook calls is asserted directly, and the cookie
+// helper is asserted absent to catch a half-finished conversion.
+func TestSelfBypassInstructionsUseSocketStorage(t *testing.T) {
+	for name, expected := range map[string]asm.BuiltinFunc{
+		"create":      asm.FnSkStorageGet,
+		"release":     asm.FnSkStorageDelete,
+		"socket_addr": asm.FnSkStorageGet,
 	} {
+		instructions := map[string]asm.Instructions{
+			"create":      selfBypassCreateInstructions(1),
+			"release":     selfBypassReleaseInstructions(1),
+			"socket_addr": selfBypassSocketAddrInstructions(1),
+		}[name]
 		found := false
+		cookie := false
 		for _, instruction := range instructions {
-			if instruction.IsBuiltinCall() && asm.BuiltinFunc(instruction.Constant) == asm.FnGetSocketCookie {
+			if !instruction.IsBuiltinCall() {
+				continue
+			}
+			switch asm.BuiltinFunc(instruction.Constant) {
+			case expected:
 				found = true
-				break
+			case asm.FnGetSocketCookie:
+				cookie = true
 			}
 		}
 		if !found {
-			t.Fatalf("%s self-bypass instructions do not read the socket cookie", name)
+			t.Errorf("%s self-bypass instructions do not call %v", name, expected)
+		}
+		if cookie {
+			t.Errorf("%s self-bypass instructions still read the socket cookie", name)
 		}
 	}
 }
