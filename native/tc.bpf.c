@@ -96,6 +96,11 @@ struct sb_tc_control {
     __u8 force_intercept_ipv4_mask[4];
     __u8 force_intercept_ipv6_prefix[16];
     __u8 force_intercept_ipv6_mask[16];
+    // policy_generation 是判定缓存的失效凭据。用户态在每次写 control 之前递增
+    // 它，而所有策略变更都汇流到那一次写（见 internal/core/tc.go 的
+    // updateControlLocked），所以缓存下来的判定只要代号对不上就作废。0 保留为
+    // "没有缓存"，永远不会被用作一个有效代号。
+    __u32 policy_generation;
 };
 
 struct sb_tc_uid_key {
@@ -151,7 +156,7 @@ struct sb_tc_assign_value {
     __u8 source_mac_valid;
 };
 
-_Static_assert(sizeof(struct sb_tc_control) == 72, "sb_tc_control ABI size");
+_Static_assert(sizeof(struct sb_tc_control) == 76, "sb_tc_control ABI size");
 _Static_assert(__builtin_offsetof(struct sb_tc_control, delivery_ifindex) == 8,
     "sb_tc_control delivery_ifindex ABI offset");
 _Static_assert(__builtin_offsetof(struct sb_tc_control, routing_mark) == 12,
@@ -160,6 +165,17 @@ _Static_assert(__builtin_offsetof(struct sb_tc_control, listener_port) == 16,
     "sb_tc_control listener_port ABI offset");
 _Static_assert(__builtin_offsetof(struct sb_tc_control, force_intercept_ipv6_mask) == 54,
     "sb_tc_control force_intercept_ipv6_mask ABI offset");
+// 本机出站判定的缓存值。判定只取决于目的地、协议、uid 和当前策略，对一条已连接
+// 的 TCP socket 来说这些在其生命周期内都不变，所以整条判定链每个 socket 只需要
+// 跑一次而不是每个包跑一次。最贵的那一环是 bypass_destination 的 LPM trie 遍历，
+// 它没有内联形式，要沿前缀位逐层下降。
+struct sb_tc_socket_verdict {
+    __u32 generation;
+    __u8 verdict;
+    __u8 reserved[3];
+};
+_Static_assert(sizeof(struct sb_tc_socket_verdict) == 8, "sb_tc_socket_verdict ABI size");
+
 _Static_assert(sizeof(struct sb_tc_assign_key) == 44, "sb_tc_assign_key ABI size");
 _Static_assert(sizeof(struct sb_tc_assign_value) == 24, "sb_tc_assign_value ABI size");
 _Static_assert(__builtin_offsetof(struct sb_tc_assign_value, socket_cookie) == 0,
@@ -241,6 +257,16 @@ MAP(tc_stats, __u32, __u64, BPF_MAP_TYPE_PERCPU_ARRAY, SB_TC_STAT_COUNT);
 // 老式 bpf_map_def 就能声明这种 map（key_size 与 max_entries 必须为 0），
 // 不需要 BTF 式的 map 定义——这一点很关键，因为构建流程会用 llvm-objcopy
 // 把 .BTF 段从对象里剥掉，见 Makefile 的 generate 目标。
+// 与 tc_self_sockets 分开而不是并进同一个值结构，是为了不动那张表的 ABI：
+// 它由用户态按 fd 写、由 cgroup 钩子读写，还被 cgroup_socket_bypass 共用。
+// 命中缓存时这张表是唯一被读的 map，所以分成两张并不会让热路径多一次查找。
+struct bpf_map_def SEC("maps") tc_local_verdict = {
+    .type = BPF_MAP_TYPE_SK_STORAGE,
+    .key_size = 0U,
+    .value_size = sizeof(struct sb_tc_socket_verdict),
+    .max_entries = 0U,
+};
+
 struct bpf_map_def SEC("maps") tc_self_sockets = {
     .type = BPF_MAP_TYPE_SK_STORAGE,
     .key_size = 0U,
@@ -283,6 +309,9 @@ static long (*sk_assign)(void *ctx, struct bpf_sock *socket, __u64 flags) =
 static void (*sk_release)(struct bpf_sock *socket) = (void *)BPF_FUNC_sk_release;
 static void *(*sk_storage_get)(void *map, void *socket, void *value, __u64 flags) =
     (void *)BPF_FUNC_sk_storage_get;
+
+// BPF_LOCAL_STORAGE_GET_F_CREATE：条目不存在时按传入的值新建。
+#define SB_TC_LOCAL_STORAGE_CREATE 1ULL
 
 INLINE void increment_stat(__u32 index) {
     if (index >= SB_TC_STAT_COUNT) return;
@@ -485,6 +514,41 @@ INLINE bool local_selected(struct __sk_buff *skb, const struct sb_tc_control *co
     if (host_destination(control, key)) return false;
     if ((control->flags & SB_TC_FLAG_LOCAL_BYPASS_PRIVATE) != 0U && private_destination(key)) return false;
     return !bypass_destination(control, key, false);
+}
+
+// local_selected_cached 把判定结果记在 socket 本地存储里，用 policy_generation
+// 做失效。一条被绕过的大流量连接原本每个包都要把整条链跑完才得出"绕过"，现在只有
+// 第一个包付全额代价。
+//
+// 只对 TCP 缓存。未连接的 UDP socket 每个包的目的地址都可能不同，而判定是按目的
+// 地算出来的，缓存下来就是错的；把目的地一起存进来再比对也不划算，那等于用一次
+// 16 字节比较换掉一次哈希查找。
+//
+// 缓存的是最终判定，不是中间结果，所以 self-bypass 那条早退路径（在调用这里之前）
+// 不受影响：sing-box 自己的 socket 根本走不到这儿。
+INLINE bool local_selected_cached(struct __sk_buff *skb, const struct sb_tc_control *control,
+    const struct sb_tc_assign_key *key, __u32 socket_metadata_value) {
+    // skb->sk 读一次、判一次空，然后只调一次 helper。
+    //
+    // 第一版分成"先只读查一次、没有再带 F_CREATE 查一次"两步，加载不了：
+    // 编译器为第二次调用重新从 ctx 加载了 skb->sk，而 verifier 只认同一条路径上
+    // 的判空，于是报 "R2 type=sock_common_or_null expected=sock_common"。带
+    // F_CREATE 一次拿到指针，再按代号决定用还是重算，既绕开了这个问题，也比两次
+    // 调用便宜。
+    void *socket = skb->sk;
+    if (key->protocol != IPPROTO_TCP_VALUE || socket == 0)
+        return local_selected(skb, control, key, socket_metadata_value);
+    // 新建的条目按这个零值初始化，generation 0 表示"还没有缓存过判定"。
+    struct sb_tc_socket_verdict initial = {};
+    struct sb_tc_socket_verdict *cached =
+        sk_storage_get(&tc_local_verdict, socket, &initial, SB_TC_LOCAL_STORAGE_CREATE);
+    if (cached == 0) return local_selected(skb, control, key, socket_metadata_value);
+    if (cached->generation != 0U && cached->generation == control->policy_generation)
+        return cached->verdict != 0U;
+    bool selected = local_selected(skb, control, key, socket_metadata_value);
+    cached->generation = control->policy_generation;
+    cached->verdict = selected ? 1U : 0U;
+    return selected;
 }
 
 INLINE bool shared_selected(const struct sb_tc_control *control,
@@ -849,7 +913,7 @@ INLINE int local_egress_mark(struct __sk_buff *skb, bool ethernet, bool track_pr
     __u8 source_mac[6];
     if (!parse_flow(skb, control, SB_TC_FLAG_LOCAL_IPV6, ethernet, &key, source_mac,
             SB_TC_STAT_LOCAL_FRAGMENT_PASS)) return TC_ACT_UNSPEC;
-    if (!local_selected(skb, control, &key, socket_metadata_value)) return TC_ACT_UNSPEC;
+    if (!local_selected_cached(skb, control, &key, socket_metadata_value)) return TC_ACT_UNSPEC;
     if (track_process) record_local_socket_cookie(&key, socket_cookie);
     return redirect_local(skb, control, ethernet);
 }
