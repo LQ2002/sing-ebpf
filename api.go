@@ -88,14 +88,15 @@ const (
 	TCPathShared         = core.TCPathShared
 	TCPathDelivery       = core.TCPathDelivery
 
-	SocketCreatorValid       = core.SocketCreatorValid
-	SocketCreatorNameValid   = core.SocketCreatorNameValid
-	SocketCreatorExeValid    = core.SocketCreatorExeValid
-	TCIdentityUIDValid       = core.TCIdentityUIDValid
-	TCIdentityCgroupValid    = core.TCIdentityCgroupValid
-	TCIdentityCreatorChecked = core.TCIdentityCreatorChecked
-	TCIdentityChargeChecked  = core.TCIdentityChargeChecked
-	TCIdentityChargeValid    = core.TCIdentityChargeValid
+	SocketCreatorValid         = core.SocketCreatorValid
+	SocketCreatorNameValid     = core.SocketCreatorNameValid
+	SocketCreatorExeValid      = core.SocketCreatorExeValid
+	SocketCreatorNameTruncated = core.SocketCreatorNameTruncated
+	TCIdentityUIDValid         = core.TCIdentityUIDValid
+	TCIdentityCgroupValid      = core.TCIdentityCgroupValid
+	TCIdentityCreatorChecked   = core.TCIdentityCreatorChecked
+	TCIdentityChargeChecked    = core.TCIdentityChargeChecked
+	TCIdentityChargeValid      = core.TCIdentityChargeValid
 
 	TCLinkFramingUnsupported = core.TCLinkFramingUnsupported
 	TCLinkFramingEthernet    = core.TCLinkFramingEthernet
