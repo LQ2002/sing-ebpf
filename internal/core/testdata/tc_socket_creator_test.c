@@ -51,6 +51,15 @@ int main(void) {
     get_socket_uid = uid;
     skb_cgroup_id = cgroup;
     sk_storage_get = read_storage;
+    // Every ABI byte, including the tail of comm, participates in equality.
+    struct sb_socket_creator sample = {.cookie = 7, .start_time_ns = 8,
+        .process_id = 9, .thread_id = 10, .user_id = 11, .flags = 1, .comm = "compare-all"};
+    assert(socket_creator_equal(&sample, &sample));
+    for (unsigned int index = 0; index < sizeof(sample); ++index) {
+        struct sb_socket_creator different = sample;
+        ((__u8 *)&different)[index] ^= 0x5a;
+        assert(!socket_creator_equal(&sample, &different));
+    }
     struct bpf_sock socket = {};
     struct __sk_buff skb = {.sk = &socket};
     struct sb_tc_assign_key key = {};

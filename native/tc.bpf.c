@@ -870,6 +870,25 @@ INLINE bool source_mac_equal(const __u8 left[6], const __u8 right[6]) {
     return left_low == right_low && left_high == right_high;
 }
 
+// Avoid memcmp: Clang may emit an unresolved libc call for the 48-byte ABI.
+// Fold scalar differences into one word so comparison stays native BPF; the
+// fixed-width memcpy loads also avoid alignment/aliasing assumptions on comm.
+INLINE bool socket_creator_equal(const struct sb_socket_creator *left, const struct sb_socket_creator *right) {
+    __u64 left_comm_low, right_comm_low, left_comm_high, right_comm_high;
+    __builtin_memcpy(&left_comm_low, left->comm, 8U);
+    __builtin_memcpy(&right_comm_low, right->comm, 8U);
+    __builtin_memcpy(&left_comm_high, left->comm + 8U, 8U);
+    __builtin_memcpy(&right_comm_high, right->comm + 8U, 8U);
+    __u64 different = left->cookie ^ right->cookie;
+    different |= left->start_time_ns ^ right->start_time_ns;
+    different |= left->process_id ^ right->process_id;
+    different |= left->thread_id ^ right->thread_id;
+    different |= left->user_id ^ right->user_id;
+    different |= left->flags ^ right->flags;
+    different |= left_comm_low ^ right_comm_low;
+    different |= left_comm_high ^ right_comm_high;
+    return different == 0U;
+}
 // build_assignment 填好 assign_socket 系列要写的值，并报告它与现有条目是否不同。
 //
 // delivery 路径的包是本机出站包被重定向回来的同一条流，本机路径（record_local_socket）
@@ -895,7 +914,7 @@ INLINE bool build_assignment(struct sb_tc_assign_value *value, const struct sb_t
         existing->path != value->path || existing->source_mac_valid != value->source_mac_valid ||
         existing->socket_uid != value->socket_uid || existing->socket_cgroup_id != value->socket_cgroup_id ||
         existing->identity_flags != value->identity_flags ||
-        __builtin_memcmp(&existing->creator, &value->creator, sizeof(value->creator)) != 0) return true;
+        !socket_creator_equal(&existing->creator, &value->creator)) return true;
     return source_mac_valid && !source_mac_equal(existing->source_mac, value->source_mac);
 }
 
