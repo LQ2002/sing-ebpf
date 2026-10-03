@@ -7,12 +7,19 @@
 
 static struct sb_tc_assign_value saved;
 static struct sb_socket_creator storage;
-static bool saved_present, storage_present;
+static struct sb_netd_uid_tag charge;
+static bool saved_present, storage_present, charge_present;
 static __u64 fake_cookie, fake_cgroup;
 static __u32 fake_uid;
-static int storage_reads, updates;
+static int storage_reads, charge_reads, updates;
 
 static void *lookup(void *map, const void *key) {
+    if (map == &netd_cookie_tags) {
+        // netd keys its table by the socket cookie.
+        assert(*(const __u64 *)key == fake_cookie);
+        ++charge_reads;
+        return charge_present ? &charge : NULL;
+    }
     assert(map == &tc_assignment);
     return saved_present ? &saved : NULL;
 }
@@ -39,9 +46,12 @@ static void reset(void) {
     fake_cgroup = 202;
     fake_uid = 303;
     storage = (struct sb_socket_creator){.cookie = fake_cookie, .start_time_ns = 999,
-        .process_id = 44, .thread_id = 45, .user_id = 0, .flags = SB_SOCKET_CREATOR_VALID,
-        .comm = "creator-test"};
-    storage_reads = updates = 0;
+        .process_id = 44, .thread_id = 45, .user_id = 0,
+        .flags = SB_SOCKET_CREATOR_VALID | SB_SOCKET_CREATOR_NAME_VALID | SB_SOCKET_CREATOR_EXE_VALID,
+        .comm = "creator-test", .process_name_hash = 0xcbf29ce484222325ULL, .exe_inode = 4242};
+    charge_present = false;
+    charge = (struct sb_netd_uid_tag){.uid = 10123, .tag = 0x5a};
+    storage_reads = charge_reads = updates = 0;
 }
 
 int main(void) {
@@ -53,7 +63,8 @@ int main(void) {
     sk_storage_get = read_storage;
     // Every ABI byte, including the tail of comm, participates in equality.
     struct sb_socket_creator sample = {.cookie = 7, .start_time_ns = 8,
-        .process_id = 9, .thread_id = 10, .user_id = 11, .flags = 1, .comm = "compare-all"};
+        .process_id = 9, .thread_id = 10, .user_id = 11, .flags = 7, .comm = "compare-all",
+        .process_name_hash = 12, .exe_inode = 13};
     assert(socket_creator_equal(&sample, &sample));
     for (unsigned int index = 0; index < sizeof(sample); ++index) {
         struct sb_socket_creator different = sample;
@@ -69,10 +80,13 @@ int main(void) {
     reset();
     record_local_socket_creator(&skb, &key);
     assert(saved.socket_cookie == fake_cookie && saved.socket_uid == fake_uid);
-    assert(saved.socket_cgroup_id == fake_cgroup && saved.identity_flags == (SB_TC_IDENTITY_VALID | SB_TC_IDENTITY_CREATOR_CHECKED));
+    // No netd entry: the charge is checked once and stays invalid.
+    assert(saved.socket_cgroup_id == fake_cgroup && saved.identity_flags ==
+        (SB_TC_IDENTITY_VALID | SB_TC_IDENTITY_CREATOR_CHECKED | SB_TC_IDENTITY_CHARGE_CHECKED));
+    assert(saved.charge_uid == 0 && saved.charge_tag == 0);
     assert(memcmp(&saved.creator, &storage, sizeof(storage)) == 0);
     struct sb_socket_creator original = saved.creator;
-    assert(storage_reads == 1 && updates == 1);
+    assert(storage_reads == 1 && charge_reads == 1 && updates == 1);
     storage.process_id = 900;
     record_local_socket_creator(&skb, &key);
     assert(storage_reads == 1 && updates == 1);
@@ -182,9 +196,65 @@ int main(void) {
     saved = value;
     assert(!build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false));
 
+    // A netd tag present at the first full-socket packet is copied once; the
+    // steady path, a billing UID change and a later retag never look again.
     reset();
+    charge_present = true;
+    record_local_socket_creator(&skb, &key);
+    assert(saved.identity_flags & SB_TC_IDENTITY_CHARGE_CHECKED);
+    assert(saved.identity_flags & SB_TC_IDENTITY_CHARGE_VALID);
+    assert(saved.charge_uid == 10123 && saved.charge_tag == 0x5a);
+    assert(charge_reads == 1 && updates == 1);
+    record_local_socket_creator(&skb, &key);
+    charge.uid = 10999;
+    fake_uid++;
+    record_local_socket_creator(&skb, &key);
+    assert(saved.charge_uid == 10123 && charge_reads == 1 && updates == 2);
+
+    // A tag that appears after the miss was cached is not seen.
+    reset();
+    record_local_socket_creator(&skb, &key);
+    charge_present = true;
+    record_local_socket_creator(&skb, &key);
+    assert(!(saved.identity_flags & SB_TC_IDENTITY_CHARGE_VALID) && charge_reads == 1);
+
+    // A non-full packet cannot check the charge; the next full one does.
+    reset();
+    charge_present = true;
+    fake_cgroup = 0;
+    record_local_socket_creator(&skb, &key);
+    assert(charge_reads == 0 && !(saved.identity_flags & SB_TC_IDENTITY_CHARGE_CHECKED));
+    fake_cgroup = 202;
+    record_local_socket_creator(&skb, &key);
+    assert(charge_reads == 1 && saved.charge_uid == 10123);
+
+    // A new cookie on the same tuple drops the old charge before rechecking.
+    charge_present = false;
+    fake_cookie++;
+    storage.cookie = fake_cookie;
+    record_local_socket_creator(&skb, &key);
+    assert(charge_reads == 2 && saved.charge_uid == 0 && saved.charge_tag == 0);
+    assert(!(saved.identity_flags & SB_TC_IDENTITY_CHARGE_VALID));
+
+    // Delivery carries the charge forward; shared clears it, and stale
+    // charge-only data on a shared entry still requires a write.
+    reset();
+    charge_present = true;
+    record_local_socket_creator(&skb, &key);
+    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_DELIVERY, false));
+    assert(value.charge_uid == saved.charge_uid && value.charge_tag == saved.charge_tag);
+    saved = value;
+    assert(!build_assignment(&value, &saved, 9, mac, SB_TC_PATH_DELIVERY, false));
+    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false));
+    assert(value.charge_uid == 0 && value.charge_tag == 0);
+    saved = value;
+    saved.charge_tag = 1; // Charge-only stale data on a shared entry.
+    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false));
+
+    reset();
+    charge_present = true;
     record_local_socket(&skb, &key);
-    assert(saved.socket_uid == fake_uid && storage_reads == 0);
+    assert(saved.socket_uid == fake_uid && storage_reads == 0 && charge_reads == 0);
     puts("creator state transitions passed (host C helpers; no kernel data plane)");
     return 0;
 }

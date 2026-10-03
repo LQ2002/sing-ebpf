@@ -56,6 +56,11 @@ func newIdentityFixture(t *testing.T, recordIdentity bool, includeUIDs ...uint32
 
 func newIdentityFixtureWithCreator(t *testing.T, recordIdentity bool, creatorMap *CiliumEBPF.Map, includeUIDs ...uint32) *identityFixture {
 	t.Helper()
+	return newIdentityFixtureWithMaps(t, recordIdentity, creatorMap, nil, includeUIDs...)
+}
+
+func newIdentityFixtureWithMaps(t *testing.T, recordIdentity bool, creatorMap, cookieTagMap *CiliumEBPF.Map, includeUIDs ...uint32) *identityFixture {
+	t.Helper()
 	requireEBPFIntegration(t, "run the TC local egress program on real sockets")
 	local, delivery := buildTestTopology(t)
 
@@ -81,6 +86,7 @@ func newIdentityFixtureWithCreator(t *testing.T, recordIdentity bool, creatorMap
 		Policy:               policy,
 		RecordSocketIdentity: recordIdentity,
 		SocketCreatorMap:     creatorMap,
+		CookieTagMap:         cookieTagMap,
 	})
 	if err != nil {
 		t.Fatal(err)
