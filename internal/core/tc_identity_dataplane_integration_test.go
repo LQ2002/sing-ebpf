@@ -51,6 +51,11 @@ type identityFixture struct {
 
 func newIdentityFixture(t *testing.T, recordIdentity bool, includeUIDs ...uint32) *identityFixture {
 	t.Helper()
+	return newIdentityFixtureWithCreator(t, recordIdentity, nil, includeUIDs...)
+}
+
+func newIdentityFixtureWithCreator(t *testing.T, recordIdentity bool, creatorMap *CiliumEBPF.Map, includeUIDs ...uint32) *identityFixture {
+	t.Helper()
 	requireEBPFIntegration(t, "run the TC local egress program on real sockets")
 	local, delivery := buildTestTopology(t)
 
@@ -75,6 +80,7 @@ func newIdentityFixture(t *testing.T, recordIdentity bool, includeUIDs ...uint32
 		EnableUDP:            true,
 		Policy:               policy,
 		RecordSocketIdentity: recordIdentity,
+		SocketCreatorMap:     creatorMap,
 	})
 	if err != nil {
 		t.Fatal(err)

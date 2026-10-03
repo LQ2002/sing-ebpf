@@ -11,6 +11,7 @@ import (
 	"time"
 
 	core "github.com/CHIZI-0618/sing-ebpf/internal/core"
+	CiliumEBPF "github.com/cilium/ebpf"
 )
 
 type (
@@ -32,6 +33,7 @@ type (
 	SharedPacketRewriteFlowHandle  = core.SharedPacketRewriteFlowHandle
 	SharedPacketRewriteSweepResult = core.SharedPacketRewriteSweepResult
 	TCAssignment                   = core.TCAssignment
+	SocketCreator                  = core.SocketCreator
 	TCStats                        = core.TCStats
 	TCLinkFraming                  = core.TCLinkFraming
 	AttachmentInfo                 = core.AttachmentInfo
@@ -83,8 +85,10 @@ const (
 	TCPathShared         = core.TCPathShared
 	TCPathDelivery       = core.TCPathDelivery
 
-	TCIdentityUIDValid    = core.TCIdentityUIDValid
-	TCIdentityCgroupValid = core.TCIdentityCgroupValid
+	SocketCreatorValid       = core.SocketCreatorValid
+	TCIdentityUIDValid       = core.TCIdentityUIDValid
+	TCIdentityCgroupValid    = core.TCIdentityCgroupValid
+	TCIdentityCreatorChecked = core.TCIdentityCreatorChecked
 
 	TCLinkFramingUnsupported = core.TCLinkFramingUnsupported
 	TCLinkFramingEthernet    = core.TCLinkFramingEthernet
@@ -228,8 +232,13 @@ type TCConfig struct {
 	// RecordSocketIdentity makes the local path record the sending socket's
 	// UID and cgroup id in each assignment, independently of TrackProcess.
 	RecordSocketIdentity bool
-	ICMPEchoReply        bool
-	AssignmentCapacity   uint32
+	// SocketCreatorMap enables creation snapshots and socket identity in local
+	// assignments, independently of TrackProcess and RecordSocketIdentity.
+	// The caller owns this SK_STORAGE map and must keep it open until TC closes.
+	// Requires key=4, value=48, max_entries=0, flags=NO_PREALLOC (without CLONE).
+	SocketCreatorMap   *CiliumEBPF.Map
+	ICMPEchoReply      bool
+	AssignmentCapacity uint32
 }
 
 type TCBackend struct {
@@ -251,6 +260,7 @@ func PrepareTC(config TCConfig) (*TCBackend, error) {
 		RoutingMark:          config.RoutingMark,
 		TrackProcess:         config.TrackProcess,
 		RecordSocketIdentity: config.RecordSocketIdentity,
+		SocketCreatorMap:     config.SocketCreatorMap,
 		ICMPEchoReply:        config.ICMPEchoReply,
 		AssignmentCapacity:   config.AssignmentCapacity,
 	}, config.SelfBypass)

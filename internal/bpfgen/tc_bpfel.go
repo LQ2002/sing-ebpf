@@ -16,6 +16,7 @@ import (
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
+	TCMapSocketCreators                         = "socket_creators"
 	TCMapTcAssignment                           = "tc_assignment"
 	TCMapTcControl                              = "tc_control"
 	TCMapTcExcludeSourceIpv4                    = "tc_exclude_source_ipv4"
@@ -40,8 +41,10 @@ const (
 	TCProgSingEbpfTcDeliveryIngress             = "sing_ebpf_tc_delivery_ingress"
 	TCProgSingEbpfTcDeliveryIngressLegacy       = "sing_ebpf_tc_delivery_ingress_legacy"
 	TCProgSingEbpfTcDeliveryIngressUdp          = "sing_ebpf_tc_delivery_ingress_udp"
+	TCProgSingEbpfTcLocalEgressEthernetCreator  = "sing_ebpf_tc_local_egress_ethernet_creator"
 	TCProgSingEbpfTcLocalEgressEthernetMark     = "sing_ebpf_tc_local_egress_ethernet_mark"
 	TCProgSingEbpfTcLocalEgressEthernetProcess  = "sing_ebpf_tc_local_egress_ethernet_process"
+	TCProgSingEbpfTcLocalEgressRawIpCreator     = "sing_ebpf_tc_local_egress_raw_ip_creator"
 	TCProgSingEbpfTcLocalEgressRawIpMark        = "sing_ebpf_tc_local_egress_raw_ip_mark"
 	TCProgSingEbpfTcLocalEgressRawIpProcess     = "sing_ebpf_tc_local_egress_raw_ip_process"
 	TCProgSingEbpfTcSharedIngressEthernet       = "sing_ebpf_tc_shared_ingress_ethernet"
@@ -97,8 +100,10 @@ type TCProgramSpecs struct {
 	SingEbpfTcDeliveryIngress             *ebpf.ProgramSpec `ebpf:"sing_ebpf_tc_delivery_ingress"`
 	SingEbpfTcDeliveryIngressLegacy       *ebpf.ProgramSpec `ebpf:"sing_ebpf_tc_delivery_ingress_legacy"`
 	SingEbpfTcDeliveryIngressUdp          *ebpf.ProgramSpec `ebpf:"sing_ebpf_tc_delivery_ingress_udp"`
+	SingEbpfTcLocalEgressEthernetCreator  *ebpf.ProgramSpec `ebpf:"sing_ebpf_tc_local_egress_ethernet_creator"`
 	SingEbpfTcLocalEgressEthernetMark     *ebpf.ProgramSpec `ebpf:"sing_ebpf_tc_local_egress_ethernet_mark"`
 	SingEbpfTcLocalEgressEthernetProcess  *ebpf.ProgramSpec `ebpf:"sing_ebpf_tc_local_egress_ethernet_process"`
+	SingEbpfTcLocalEgressRawIpCreator     *ebpf.ProgramSpec `ebpf:"sing_ebpf_tc_local_egress_raw_ip_creator"`
 	SingEbpfTcLocalEgressRawIpMark        *ebpf.ProgramSpec `ebpf:"sing_ebpf_tc_local_egress_raw_ip_mark"`
 	SingEbpfTcLocalEgressRawIpProcess     *ebpf.ProgramSpec `ebpf:"sing_ebpf_tc_local_egress_raw_ip_process"`
 	SingEbpfTcSharedIngressEthernet       *ebpf.ProgramSpec `ebpf:"sing_ebpf_tc_shared_ingress_ethernet"`
@@ -113,6 +118,7 @@ type TCProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type TCMapSpecs struct {
+	SocketCreators      *ebpf.MapSpec `ebpf:"socket_creators"`
 	TcAssignment        *ebpf.MapSpec `ebpf:"tc_assignment"`
 	TcControl           *ebpf.MapSpec `ebpf:"tc_control"`
 	TcExcludeSourceIpv4 *ebpf.MapSpec `ebpf:"tc_exclude_source_ipv4"`
@@ -162,6 +168,7 @@ func (o *TCObjects) Close() error {
 //
 // It can be passed to LoadTCObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TCMaps struct {
+	SocketCreators      *ebpf.Map `ebpf:"socket_creators"`
 	TcAssignment        *ebpf.Map `ebpf:"tc_assignment"`
 	TcControl           *ebpf.Map `ebpf:"tc_control"`
 	TcExcludeSourceIpv4 *ebpf.Map `ebpf:"tc_exclude_source_ipv4"`
@@ -187,6 +194,7 @@ type TCMaps struct {
 
 func (m *TCMaps) Close() error {
 	return _TCClose(
+		m.SocketCreators,
 		m.TcAssignment,
 		m.TcControl,
 		m.TcExcludeSourceIpv4,
@@ -224,8 +232,10 @@ type TCPrograms struct {
 	SingEbpfTcDeliveryIngress             *ebpf.Program `ebpf:"sing_ebpf_tc_delivery_ingress"`
 	SingEbpfTcDeliveryIngressLegacy       *ebpf.Program `ebpf:"sing_ebpf_tc_delivery_ingress_legacy"`
 	SingEbpfTcDeliveryIngressUdp          *ebpf.Program `ebpf:"sing_ebpf_tc_delivery_ingress_udp"`
+	SingEbpfTcLocalEgressEthernetCreator  *ebpf.Program `ebpf:"sing_ebpf_tc_local_egress_ethernet_creator"`
 	SingEbpfTcLocalEgressEthernetMark     *ebpf.Program `ebpf:"sing_ebpf_tc_local_egress_ethernet_mark"`
 	SingEbpfTcLocalEgressEthernetProcess  *ebpf.Program `ebpf:"sing_ebpf_tc_local_egress_ethernet_process"`
+	SingEbpfTcLocalEgressRawIpCreator     *ebpf.Program `ebpf:"sing_ebpf_tc_local_egress_raw_ip_creator"`
 	SingEbpfTcLocalEgressRawIpMark        *ebpf.Program `ebpf:"sing_ebpf_tc_local_egress_raw_ip_mark"`
 	SingEbpfTcLocalEgressRawIpProcess     *ebpf.Program `ebpf:"sing_ebpf_tc_local_egress_raw_ip_process"`
 	SingEbpfTcSharedIngressEthernet       *ebpf.Program `ebpf:"sing_ebpf_tc_shared_ingress_ethernet"`
@@ -241,8 +251,10 @@ func (p *TCPrograms) Close() error {
 		p.SingEbpfTcDeliveryIngress,
 		p.SingEbpfTcDeliveryIngressLegacy,
 		p.SingEbpfTcDeliveryIngressUdp,
+		p.SingEbpfTcLocalEgressEthernetCreator,
 		p.SingEbpfTcLocalEgressEthernetMark,
 		p.SingEbpfTcLocalEgressEthernetProcess,
+		p.SingEbpfTcLocalEgressRawIpCreator,
 		p.SingEbpfTcLocalEgressRawIpMark,
 		p.SingEbpfTcLocalEgressRawIpProcess,
 		p.SingEbpfTcSharedIngressEthernet,
