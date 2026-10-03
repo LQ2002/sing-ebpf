@@ -75,6 +75,16 @@
 #define SB_TC_PATH_DELIVERY 2U
 #define SB_TC_PATH_SOURCE_MAC_VALID 0x80U
 
+// sb_tc_assign_value.identity_flags。两位总是一起置位或一起清零：
+// bpf_get_socket_uid 和 bpf_skb_cgroup_id 在内核里（net/core/filter.c，v6.12）
+// 用的是同一个判断——sk_to_full_sk(skb->sk) 之后必须是 full socket——不满足时
+// 前者返回 overflowuid、后者返回 0。所以 cgroup id 非 0 就同时证明 uid 有效，
+// 不需要拿 overflowuid（65534，可能是真实 uid）去猜。分成两位只是让读取方不必
+// 知道这层关系。
+#define SB_TC_IDENTITY_UID_VALID (1U << 0)
+#define SB_TC_IDENTITY_CGROUP_VALID (1U << 1)
+#define SB_TC_IDENTITY_VALID (SB_TC_IDENTITY_UID_VALID | SB_TC_IDENTITY_CGROUP_VALID)
+
 #define SB_TC_STAT_SOCKET_LOOKUP_FAILURE 0U
 #define SB_TC_STAT_SK_ASSIGN_FAILURE 1U
 #define SB_TC_STAT_ASSIGNMENT_UPDATE_FAILURE 2U
@@ -154,6 +164,19 @@ struct sb_tc_assign_value {
     __u8 source_mac[6];
     __u8 path;
     __u8 source_mac_valid;
+    // 以下是本机出站路径记录的 socket 身份，只在“身份采集”程序变体里填写
+    // （见 record_local_socket）。shared 路径的流量不是本机 socket 发的，
+    // 这三个字段保持 0，不伪造本机身份；delivery 路径原样保留本机路径写下的值。
+    //
+    // socket_uid 是 sk->sk_uid，即 socket 的“记账 UID”：netd 会把替应用发的
+    // DNS socket fchown 成应用的 UID，所以它不一定是创建进程的 UID。
+    // socket_cgroup_id 是 socket 创建时所在的 cgroup v2 id（cgroup_sk_alloc，
+    // kernel/cgroup/cgroup.c），之后进程迁移 cgroup 也不会改变它；Android 上每个
+    // 进程有自己的 /uid_X/pid_Y cgroup，所以它能把 socket 定位到创建它的进程。
+    __u32 socket_uid;
+    __u64 socket_cgroup_id;
+    __u32 identity_flags;
+    __u32 reserved;
 };
 
 _Static_assert(sizeof(struct sb_tc_control) == 76, "sb_tc_control ABI size");
@@ -176,10 +199,35 @@ struct sb_tc_socket_verdict {
 };
 _Static_assert(sizeof(struct sb_tc_socket_verdict) == 8, "sb_tc_socket_verdict ABI size");
 
+// 判定缓存整体按一个 64 位字读写。同一个 TCP socket 的包可以同时在两个 CPU 上
+// 过 TC（用户线程发送和软中断里的重传/ACK），如果分两次写 generation 和
+// verdict，交错之后可能留下“新代号＋旧判定”。对齐的 8 字节访问在 arm64 和
+// x86-64 上都是单次拷贝原子的；socket 本地存储的数据区按 8 字节对齐
+// （struct bpf_local_storage_data 的 data[] __aligned(8)）。
+union sb_tc_socket_verdict_word {
+    struct sb_tc_socket_verdict fields;
+    __u64 word;
+};
+_Static_assert(sizeof(union sb_tc_socket_verdict_word) == 8, "sb_tc_socket_verdict_word size");
+
 _Static_assert(sizeof(struct sb_tc_assign_key) == 44, "sb_tc_assign_key ABI size");
-_Static_assert(sizeof(struct sb_tc_assign_value) == 24, "sb_tc_assign_value ABI size");
+_Static_assert(sizeof(struct sb_tc_assign_value) == 40, "sb_tc_assign_value ABI size");
 _Static_assert(__builtin_offsetof(struct sb_tc_assign_value, socket_cookie) == 0,
     "sb_tc_assign_value socket_cookie ABI offset");
+_Static_assert(__builtin_offsetof(struct sb_tc_assign_value, ifindex) == 8,
+    "sb_tc_assign_value ifindex ABI offset");
+_Static_assert(__builtin_offsetof(struct sb_tc_assign_value, source_mac) == 12,
+    "sb_tc_assign_value source_mac ABI offset");
+_Static_assert(__builtin_offsetof(struct sb_tc_assign_value, path) == 18,
+    "sb_tc_assign_value path ABI offset");
+_Static_assert(__builtin_offsetof(struct sb_tc_assign_value, source_mac_valid) == 19,
+    "sb_tc_assign_value source_mac_valid ABI offset");
+_Static_assert(__builtin_offsetof(struct sb_tc_assign_value, socket_uid) == 20,
+    "sb_tc_assign_value socket_uid ABI offset");
+_Static_assert(__builtin_offsetof(struct sb_tc_assign_value, socket_cgroup_id) == 24,
+    "sb_tc_assign_value socket_cgroup_id ABI offset");
+_Static_assert(__builtin_offsetof(struct sb_tc_assign_value, identity_flags) == 32,
+    "sb_tc_assign_value identity_flags ABI offset");
 
 struct ethernet_header {
     __u8 destination[6];
@@ -295,6 +343,7 @@ static long (*map_update)(void *map, const void *key, const void *value, __u64 f
 static long (*map_delete)(void *map, const void *key) = (void *)BPF_FUNC_map_delete_elem;
 static __u32 (*get_socket_uid)(void *ctx) = (void *)BPF_FUNC_get_socket_uid;
 static __u64 (*get_socket_cookie)(void *ctx) = (void *)BPF_FUNC_get_socket_cookie;
+static __u64 (*skb_cgroup_id)(void *ctx) = (void *)BPF_FUNC_skb_cgroup_id;
 static long (*redirect)(int ifindex, __u64 flags) = (void *)BPF_FUNC_redirect;
 static long (*skb_store_bytes)(void *ctx, __u32 offset, const void *from, __u32 length, __u64 flags) =
     (void *)BPF_FUNC_skb_store_bytes;
@@ -543,11 +592,25 @@ INLINE bool local_selected_cached(struct __sk_buff *skb, const struct sb_tc_cont
     struct sb_tc_socket_verdict *cached =
         sk_storage_get(&tc_local_verdict, socket, &initial, SB_TC_LOCAL_STORAGE_CREATE);
     if (cached == 0) return local_selected(skb, control, key, socket_metadata_value);
-    if (cached->generation != 0U && cached->generation == control->policy_generation)
-        return cached->verdict != 0U;
+    // 代号必须在计算之前读。用户态先改策略 map、最后才写 control 推进代号
+    // （internal/core/tc.go 的 UpdateUIDPolicy 等）；若在计算之后才读代号，
+    // 一次跨过更新的计算会拿旧 map 得出的结果去标记新代号，而新代号之后不会再
+    // 变，这条 socket 就永远停在旧判定上。先读，最坏情况是给结果标上旧代号，
+    // 下一个包看到代号不同就重算。
+    //
+    // 计算之后再读一次：两次不同说明计算跨过了一次 control 写，结果可能混合了
+    // 新旧状态，这种结果不缓存。这只能缩小、不能在弱内存序的 CPU 上从形式上消除
+    // “读到撕裂的 control”的窗口——control 由 bpf 系统调用整块拷贝，没有锁。
+    __u32 generation = *(volatile const __u32 *)&control->policy_generation;
+    union sb_tc_socket_verdict_word current = {.word = *(volatile const __u64 *)cached};
+    if (current.fields.generation != 0U && current.fields.generation == generation)
+        return current.fields.verdict != 0U;
     bool selected = local_selected(skb, control, key, socket_metadata_value);
-    cached->generation = control->policy_generation;
-    cached->verdict = selected ? 1U : 0U;
+    if (*(volatile const __u32 *)&control->policy_generation != generation) return selected;
+    union sb_tc_socket_verdict_word next = {
+        .fields = {.generation = generation, .verdict = selected ? 1U : 0U},
+    };
+    *(volatile __u64 *)cached = next.word;
     return selected;
 }
 
@@ -765,6 +828,33 @@ INLINE bool source_mac_equal(const __u8 left[6], const __u8 right[6]) {
     return left_low == right_low && left_high == right_high;
 }
 
+// build_assignment 填好 assign_socket 系列要写的值，并报告它与现有条目是否不同。
+//
+// delivery 路径的包是本机出站包被重定向回来的同一条流，本机路径（record_local_socket）
+// 已经在同一个键下写了 cookie 和 socket 身份，这里原样带过去，否则 delivery 的第一次
+// 写就会把它们抹掉。shared 路径的包来自别的主机，没有本机 socket：cookie 与身份都是 0，
+// 若同键下残留着本机条目，就把它改写成 0，而不是继续挂着一个不属于这条流的身份。
+INLINE bool build_assignment(struct sb_tc_assign_value *value, const struct sb_tc_assign_value *existing,
+    __u32 ifindex, const __u8 source_mac[6], __u8 path, bool source_mac_valid) {
+    __builtin_memset(value, 0, sizeof(*value));
+    value->ifindex = ifindex;
+    value->path = path;
+    value->source_mac_valid = source_mac_valid;
+    __builtin_memcpy(value->source_mac, source_mac, 6U);
+    if (path == SB_TC_PATH_DELIVERY && existing != 0) {
+        value->socket_cookie = existing->socket_cookie;
+        value->socket_uid = existing->socket_uid;
+        value->socket_cgroup_id = existing->socket_cgroup_id;
+        value->identity_flags = existing->identity_flags;
+    }
+    if (existing == 0) return true;
+    if (existing->socket_cookie != value->socket_cookie || existing->ifindex != value->ifindex ||
+        existing->path != value->path || existing->source_mac_valid != value->source_mac_valid ||
+        existing->socket_uid != value->socket_uid || existing->socket_cgroup_id != value->socket_cgroup_id ||
+        existing->identity_flags != value->identity_flags) return true;
+    return source_mac_valid && !source_mac_equal(existing->source_mac, value->source_mac);
+}
+
 NOINLINE int assign_socket(struct __sk_buff *skb, const struct sb_tc_control *control,
     const struct sb_tc_assign_key *key, const __u8 source_mac[6], __u8 path) {
     bool source_mac_valid = (path & SB_TC_PATH_SOURCE_MAC_VALID) != 0U;
@@ -780,17 +870,8 @@ NOINLINE int assign_socket(struct __sk_buff *skb, const struct sb_tc_control *co
     if (key->protocol == IPPROTO_UDP_VALUE && path == SB_TC_PATH_SHARED)
         assignment_key.interface_index = skb->ifindex;
     struct sb_tc_assign_value *existing = map_lookup(&tc_assignment, &assignment_key);
-    struct sb_tc_assign_value value = {
-        .socket_cookie = path == SB_TC_PATH_DELIVERY && existing != 0 ? existing->socket_cookie : 0U,
-        .ifindex = skb->ifindex,
-        .path = path,
-        .source_mac_valid = source_mac_valid,
-    };
-    __builtin_memcpy(value.source_mac, source_mac, 6U);
-    bool assignment_changed = existing == 0 || existing->socket_cookie != value.socket_cookie ||
-        existing->ifindex != value.ifindex ||
-        existing->path != value.path || existing->source_mac_valid != value.source_mac_valid;
-    if (!assignment_changed && source_mac_valid) assignment_changed = !source_mac_equal(existing->source_mac, value.source_mac);
+    struct sb_tc_assign_value value;
+    bool assignment_changed = build_assignment(&value, existing, skb->ifindex, source_mac, path, source_mac_valid);
     long result = sk_assign(skb, socket, 0U);
     sk_release(socket);
     if (result != 0) {
@@ -819,17 +900,8 @@ NOINLINE int assign_socket_legacy(struct __sk_buff *skb, const struct sb_tc_cont
     if (key->protocol == IPPROTO_UDP_VALUE && path == SB_TC_PATH_SHARED)
         assignment_key.interface_index = skb->ifindex;
     struct sb_tc_assign_value *existing = map_lookup(&tc_assignment, &assignment_key);
-    struct sb_tc_assign_value value = {
-        .socket_cookie = path == SB_TC_PATH_DELIVERY && existing != 0 ? existing->socket_cookie : 0U,
-        .ifindex = skb->ifindex,
-        .path = path,
-        .source_mac_valid = source_mac_valid,
-    };
-    __builtin_memcpy(value.source_mac, source_mac, 6U);
-    bool assignment_changed = existing == 0 || existing->socket_cookie != value.socket_cookie ||
-        existing->ifindex != value.ifindex ||
-        existing->path != value.path || existing->source_mac_valid != value.source_mac_valid;
-    if (!assignment_changed && source_mac_valid) assignment_changed = !source_mac_equal(existing->source_mac, value.source_mac);
+    struct sb_tc_assign_value value;
+    bool assignment_changed = build_assignment(&value, existing, skb->ifindex, source_mac, path, source_mac_valid);
     long result = sk_assign(skb, socket, 0U);
     sk_release(socket);
     if (result != 0) {
@@ -855,17 +927,8 @@ NOINLINE int assign_udp_socket(struct __sk_buff *skb, const struct sb_tc_control
     struct sb_tc_assign_key assignment_key = *key;
     assignment_key.interface_index = path == SB_TC_PATH_SHARED ? skb->ifindex : 0U;
     struct sb_tc_assign_value *existing = map_lookup(&tc_assignment, &assignment_key);
-    struct sb_tc_assign_value value = {
-        .socket_cookie = path == SB_TC_PATH_DELIVERY && existing != 0 ? existing->socket_cookie : 0U,
-        .ifindex = skb->ifindex,
-        .path = path,
-        .source_mac_valid = source_mac_valid,
-    };
-    __builtin_memcpy(value.source_mac, source_mac, 6U);
-    bool assignment_changed = existing == 0 || existing->socket_cookie != value.socket_cookie ||
-        existing->ifindex != value.ifindex || existing->path != value.path ||
-        existing->source_mac_valid != value.source_mac_valid;
-    if (!assignment_changed && source_mac_valid) assignment_changed = !source_mac_equal(existing->source_mac, value.source_mac);
+    struct sb_tc_assign_value value;
+    bool assignment_changed = build_assignment(&value, existing, skb->ifindex, source_mac, path, source_mac_valid);
     long result = sk_assign(skb, socket, 0U);
     sk_release(socket);
     if (result != 0) {
@@ -879,11 +942,47 @@ NOINLINE int assign_udp_socket(struct __sk_buff *skb, const struct sb_tc_control
     return TC_ACT_OK;
 }
 
-INLINE void record_local_socket_cookie(const struct sb_tc_assign_key *key, __u64 socket_cookie) {
+// record_local_socket 把本机出站 socket 的 cookie 和身份（UID、cgroup id）记进
+// tc_assignment，供用户态在连接到达监听端时按流查回。只有身份采集变体
+// （*_process 段）调用它，轻量变体（*_mark 段）一个 helper 都不多调。
+//
+// 稳态每个被选中的包：一次 cookie helper、一次哈希查找、一次 uid helper。
+// cookie 相同不能直接早退：socket 的 cgroup 在创建时就定下（cgroup_sk_alloc），
+// 同一 cookie 下不会变，但 sk_uid 可以被 fchown 改掉（net/socket.c 的
+// sockfs_setattr），所以每个包还要比一次 uid。cookie 不同（新 socket 复用了同一
+// 五元组，UDP 常见）则整条重写，旧条目的 delivery 字段一并丢弃，由 delivery
+// 路径下一个包重新填。
+//
+// cgroup id 为 0 表示这一刻 skb 上没有 full socket（例如 TIME_WAIT 发出的包，
+// 它沿用原 socket 的 cookie）。这种包不降级已有的有效身份。
+INLINE void record_local_socket(struct __sk_buff *skb, const struct sb_tc_assign_key *key) {
+    __u64 socket_cookie = get_socket_cookie(skb);
     if (socket_cookie == 0U) return;
     struct sb_tc_assign_value *existing = map_lookup(&tc_assignment, key);
-    if (existing != 0 && existing->socket_cookie == socket_cookie) return;
-    struct sb_tc_assign_value value = {.socket_cookie = socket_cookie};
+    struct sb_tc_assign_value value = {};
+    if (existing != 0 && existing->socket_cookie == socket_cookie) {
+        __u32 socket_uid = 0U;
+        if ((existing->identity_flags & SB_TC_IDENTITY_VALID) == SB_TC_IDENTITY_VALID) {
+            socket_uid = get_socket_uid(skb);
+            if (socket_uid == existing->socket_uid) return;
+        }
+        __u64 cgroup_id = skb_cgroup_id(skb);
+        if (cgroup_id == 0U) return;
+        if ((existing->identity_flags & SB_TC_IDENTITY_VALID) != SB_TC_IDENTITY_VALID)
+            socket_uid = get_socket_uid(skb);
+        value = *existing;
+        value.socket_uid = socket_uid;
+        value.socket_cgroup_id = cgroup_id;
+        value.identity_flags = SB_TC_IDENTITY_VALID;
+    } else {
+        value.socket_cookie = socket_cookie;
+        __u64 cgroup_id = skb_cgroup_id(skb);
+        if (cgroup_id != 0U) {
+            value.socket_uid = get_socket_uid(skb);
+            value.socket_cgroup_id = cgroup_id;
+            value.identity_flags = SB_TC_IDENTITY_VALID;
+        }
+    }
     map_update(&tc_assignment, key, &value, BPF_ANY);
 }
 
@@ -904,9 +1003,6 @@ INLINE int local_egress_mark(struct __sk_buff *skb, bool ethernet, bool track_pr
     const struct sb_tc_control *control = load_control();
     if (control == 0 || control->enabled == 0U || control->delivery_ifindex == 0U) return TC_ACT_UNSPEC;
     if (skb->ingress_ifindex != 0U) return TC_ACT_UNSPEC;
-    // socket cookie 仍然要读，但只为了进程追踪把它记进 tc_assignment；
-    // 自绕过的判定已经不再经过 cookie。
-    __u64 socket_cookie = track_process ? get_socket_cookie(skb) : 0U;
     __u32 socket_metadata_value = socket_metadata(skb);
     if ((socket_metadata_value & SB_EBPF_SOCKET_METADATA_SELF_BYPASS) != 0U) return TC_ACT_UNSPEC;
     struct sb_tc_assign_key key;
@@ -914,7 +1010,8 @@ INLINE int local_egress_mark(struct __sk_buff *skb, bool ethernet, bool track_pr
     if (!parse_flow(skb, control, SB_TC_FLAG_LOCAL_IPV6, ethernet, &key, source_mac,
             SB_TC_STAT_LOCAL_FRAGMENT_PASS)) return TC_ACT_UNSPEC;
     if (!local_selected_cached(skb, control, &key, socket_metadata_value)) return TC_ACT_UNSPEC;
-    if (track_process) record_local_socket_cookie(&key, socket_cookie);
+    // 只记被选中的流：没被选中的包不会到达 sing-box，没人来查它的条目。
+    if (track_process) record_local_socket(skb, &key);
     return redirect_local(skb, control, ethernet);
 }
 

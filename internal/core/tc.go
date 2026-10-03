@@ -28,6 +28,7 @@ const (
 	tcAssignmentCapacity        = 65536
 	CompactTCAssignmentCapacity = 16384
 	tcPortPolicyCapacity        = 4096
+	tcUIDPolicyCapacity         = maxUIDPolicyEntries
 )
 
 const (
@@ -81,20 +82,27 @@ const (
 )
 
 type TCConfig struct {
-	ListenerPort       uint16
-	EnableLocal        bool
-	EnableShared       bool
-	EnableIPv4         bool
-	EnableLocalIPv6    bool
-	EnableSharedIPv6   bool
-	EnableTCP          bool
-	EnableUDP          bool
-	DeliveryInterface  uint32
-	Policy             CompiledPolicy
-	RoutingMark        uint32
-	SelfBypassMap      *CiliumEBPF.Map
-	TrackProcess       bool
-	AssignmentCapacity uint32
+	ListenerPort      uint16
+	EnableLocal       bool
+	EnableShared      bool
+	EnableIPv4        bool
+	EnableLocalIPv6   bool
+	EnableSharedIPv6  bool
+	EnableTCP         bool
+	EnableUDP         bool
+	DeliveryInterface uint32
+	Policy            CompiledPolicy
+	RoutingMark       uint32
+	SelfBypassMap     *CiliumEBPF.Map
+	TrackProcess      bool
+	// RecordSocketIdentity loads the local egress variant that writes the
+	// sending socket's cookie, UID and cgroup id into each assignment (see
+	// TCAssignment). It is independent of TrackProcess, which the old
+	// ProcessTracker sets for the cookie alone; either one selects the same
+	// variant, and leaving both false keeps the lighter variant that calls no
+	// identity helper at all.
+	RecordSocketIdentity bool
+	AssignmentCapacity   uint32
 	// ICMPEchoReply loads the independent icmp_echo_reply object (see
 	// tc_icmp_echo_reply.go) and attaches it wherever this TC data plane already
 	// attaches local or shared filters. Left false, prepareTC never touches
@@ -142,12 +150,37 @@ type tcAssignKey struct {
 	DestinationAddress [16]byte
 }
 
+// TCAssignment mirrors struct sb_tc_assign_value in native/tc.bpf.c; the
+// layout is asserted on both sides (TestTCABI, the C _Static_asserts, and
+// TestEmbeddedTCObjectLayout for the compiled object).
 type TCAssignment struct {
 	SocketCookie   uint64
 	InterfaceIndex uint32
 	SourceMAC      MACAddress
 	Path           uint8
 	SourceMACValid uint8
+	// SocketUID is the socket's sk_uid, which fchown can change after the
+	// socket was created (Android's netd does that to DNS sockets it opens on
+	// an app's behalf). Valid only with TCIdentityUIDValid.
+	SocketUID uint32
+	// SocketCgroupID is the cgroup v2 id the socket was created in. It never
+	// changes for the life of the socket. Valid only with
+	// TCIdentityCgroupValid.
+	SocketCgroupID uint64
+	IdentityFlags  uint32
+	Reserved       uint32
+}
+
+const (
+	TCIdentityUIDValid    uint32 = 1 << 0
+	TCIdentityCgroupValid uint32 = 1 << 1
+)
+
+// HasSocketIdentity reports whether the local egress path recorded the
+// sending socket's UID and cgroup id for this flow. Shared-path flows never
+// have one: their packets come from another host, not from a local socket.
+func (a TCAssignment) HasSocketIdentity() bool {
+	return a.IdentityFlags&(TCIdentityUIDValid|TCIdentityCgroupValid) == TCIdentityUIDValid|TCIdentityCgroupValid
 }
 
 type tcRuntime struct {
@@ -170,6 +203,13 @@ type TCBackend struct {
 	sharedBypassIPv6 []netip.Prefix
 	hostIPv4         [][4]byte
 	hostIPv6         [][16]byte
+	// uidEntries and uidDefaultBypass are the UID policy the tc_uid_policy map
+	// and the control flags currently hold; UpdateUIDPolicy diffs against them.
+	uidEntries       []uidLPMKey
+	uidDefaultBypass bool
+	// controlWriteFault, when set (tests only), runs before every control
+	// write and fails it with the error it returns.
+	controlWriteFault func() error
 	// icmpEchoReply is nil unless TCConfig.ICMPEchoReply was set; see
 	// tc_icmp_echo_reply.go. It is a standalone backend (ICMPEchoReplyBackend) rather
 	// than fields inline here because shared.data_plane: packet_rewrite hosts
@@ -217,11 +257,14 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 	}
 	_ = raiseMemlockLimit()
 	mapOverrides := map[string]mapSpecOverride{
-		"tc_control":             {name: "sb_tc_ctl", mapType: CiliumEBPF.Array, maxEntries: 1},
-		"tc_listener_sockets":    {name: "sb_tc_listen", mapType: CiliumEBPF.SockMap, maxEntries: 2},
-		"tc_assignment":          {name: "sb_tc_assign", mapType: CiliumEBPF.LRUHash, maxEntries: config.AssignmentCapacity},
-		"tc_stats":               {name: "sb_tc_stats", mapType: CiliumEBPF.PerCPUArray, maxEntries: tcStatCount},
-		"tc_uid_policy":          {name: "sb_tc_uid", mapType: CiliumEBPF.LPMTrie, maxEntries: max(uint32(len(uidEntries)), 1), flags: bpfFlagNoPrealloc},
+		"tc_control":          {name: "sb_tc_ctl", mapType: CiliumEBPF.Array, maxEntries: 1},
+		"tc_listener_sockets": {name: "sb_tc_listen", mapType: CiliumEBPF.SockMap, maxEntries: 2},
+		"tc_assignment":       {name: "sb_tc_assign", mapType: CiliumEBPF.LRUHash, maxEntries: config.AssignmentCapacity},
+		"tc_stats":            {name: "sb_tc_stats", mapType: CiliumEBPF.PerCPUArray, maxEntries: tcStatCount},
+		// Sized to the compile limit rather than to the startup policy, so that
+		// UpdateUIDPolicy can grow it later. NO_PREALLOC: an LPM trie allocates
+		// each node on insert, so unused capacity costs no memory.
+		"tc_uid_policy":          {name: "sb_tc_uid", mapType: CiliumEBPF.LPMTrie, maxEntries: tcUIDPolicyCapacity, flags: bpfFlagNoPrealloc},
 		"tc_local_bypass_ipv4":   {name: "sb_tc_lbypass4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxDestinationCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
 		"tc_local_bypass_ipv6":   {name: "sb_tc_lbypass6", mapType: CiliumEBPF.LPMTrie, maxEntries: maxDestinationCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
 		"tc_shared_bypass_ipv4":  {name: "sb_tc_sbypass4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxDestinationCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
@@ -302,12 +345,14 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		controlValue.ForceInterceptIPv6Mask = prefixMask16(forceInterceptIPv6.Bits())
 	}
 	backend := &TCBackend{
-		runtime:         &tcRuntime{maps: maps, programs: loadedPrograms},
-		tcpListenerMap:  config.EnableTCP && !legacyTCP,
-		control:         controlValue,
-		controlMapFD:    maps["tc_control"].FD(),
-		assignmentMapFD: maps["tc_assignment"].FD(),
-		selfMapExternal: config.EnableLocal && config.SelfBypassMap != nil,
+		runtime:          &tcRuntime{maps: maps, programs: loadedPrograms},
+		tcpListenerMap:   config.EnableTCP && !legacyTCP,
+		control:          controlValue,
+		controlMapFD:     maps["tc_control"].FD(),
+		assignmentMapFD:  maps["tc_assignment"].FD(),
+		selfMapExternal:  config.EnableLocal && config.SelfBypassMap != nil,
+		uidEntries:       slices.Clone(uidEntries),
+		uidDefaultBypass: policy.uidDefaultBypass,
 	}
 	// From here, backend owns maps and loadedPrograms: giving up on either of the
 	// steps below has to close it rather than just returning the step's error, or
@@ -370,7 +415,7 @@ func loadTCResources(config TCConfig, baseOverrides map[string]mapSpecOverride, 
 	if config.EnableLocal {
 		localEthernetSection := "classifier/local_egress_ethernet_mark"
 		localRawIPSection := "classifier/local_egress_raw_ip_mark"
-		if config.TrackProcess {
+		if config.TrackProcess || config.RecordSocketIdentity {
 			localEthernetSection = "classifier/local_egress_ethernet_process"
 			localRawIPSection = "classifier/local_egress_raw_ip_process"
 		}
@@ -518,8 +563,11 @@ func (b *TCBackend) invalidateLocked(operation string, cause error) error {
 // That works because every mutation of TC policy already ends here: the flag
 // changes obviously do, and so do the two map-backed policies, because
 // UpdateCompiledBypassCIDR and UpdateHostAddresses both set flags alongside
-// their map writes and call this afterwards. UID and port policy cannot change
-// without rebuilding the backend, which creates a fresh verdict map anyway. So
+// their map writes and call this afterwards, and UpdateUIDPolicy does the same.
+// Port policy cannot change without rebuilding the backend, which creates a
+// fresh verdict map anyway. Every rollback path also ends here (see
+// restoreControlAfterRollbackLocked), because verdicts computed while the maps
+// were half-updated were cached under the generation in force then. So
 // bumping here invalidates every cached verdict on every policy change, and no
 // caller has to remember to do it.
 //
@@ -528,6 +576,11 @@ func (b *TCBackend) invalidateLocked(operation string, cause error) error {
 // serving a verdict computed under the previous policy -- which is why the
 // invariant lives in one function instead of at each call site.
 func (b *TCBackend) updateControlLocked() error {
+	if b.controlWriteFault != nil {
+		if err := b.controlWriteFault(); err != nil {
+			return eBPFOperationError("update TC eBPF control", err)
+		}
+	}
 	b.control.PolicyGeneration++
 	if b.control.PolicyGeneration == 0 {
 		b.control.PolicyGeneration = 1
@@ -781,7 +834,9 @@ func (b *TCBackend) updateDestinationCIDRPolicy(policy dualStackCIDRPrefixes, sh
 		if policyRollbackFailed(err) {
 			return false, b.invalidateLocked("bypass CIDR policy", err)
 		}
-		return false, err
+		// Rolled back, but packets classified meanwhile may have cached a
+		// verdict from the partial state under the current generation.
+		return false, b.restoreControlAfterRollbackLocked("bypass CIDR policy", b.control.Flags, err)
 	}
 	previousFlags := b.control.Flags
 	if shared {
@@ -828,8 +883,7 @@ func (b *TCBackend) updateDestinationCIDRPolicy(policy dualStackCIDRPrefixes, sh
 		} else {
 			b.bypassIPv4, b.bypassIPv6 = previousIPv4, previousIPv6
 		}
-		b.control.Flags = previousFlags
-		return false, err
+		return false, b.restoreControlAfterRollbackLocked("bypass CIDR policy", previousFlags, err)
 	}
 	return changed, nil
 }
@@ -863,7 +917,7 @@ func (b *TCBackend) UpdateHostAddresses(addresses []netip.Addr) error {
 		if policyRollbackFailed(err) {
 			return b.invalidateLocked("host address policy", err)
 		}
-		return err
+		return b.restoreControlAfterRollbackLocked("host address policy", b.control.Flags, err)
 	}
 	previousIPv4, previousIPv6 := b.hostIPv4, b.hostIPv6
 	previousFlags := b.control.Flags
@@ -899,8 +953,7 @@ func (b *TCBackend) UpdateHostAddresses(addresses []netip.Addr) error {
 			)
 		}
 		b.hostIPv4, b.hostIPv6 = previousIPv4, previousIPv6
-		b.control.Flags = previousFlags
-		return err
+		return b.restoreControlAfterRollbackLocked("host address policy", previousFlags, err)
 	}
 	return nil
 }
@@ -1025,5 +1078,6 @@ func (b *TCBackend) Close() error {
 	b.sharedBypassIPv6 = nil
 	b.hostIPv4 = nil
 	b.hostIPv6 = nil
+	b.uidEntries = nil
 	return closeErr
 }
