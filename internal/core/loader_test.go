@@ -507,3 +507,31 @@ func TestTCSocketCreatorVariantIsolation(t *testing.T) {
 		t.Fatalf("bad creator map ABI: %+v", info)
 	}
 }
+
+// The BPF compiler can lower even a constant-size C builtin to an external
+// libcall. CollectionSpec parsing succeeds, but loading such a program fails
+// before the verifier runs. Every symbolic BPF-to-BPF call must resolve within
+// the program after cilium links the object's subprograms.
+func TestEmbeddedTCProgramsHaveNoUnresolvedCalls(t *testing.T) {
+	spec, err := loadTC()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, program := range spec.Programs {
+		symbols, err := program.Instructions.SymbolOffsets()
+		if err != nil {
+			t.Fatalf("section %s symbols: %v", program.SectionName, err)
+		}
+		for index, instruction := range program.Instructions {
+			// -1 is the unresolved offset used by cilium. Numeric calls whose
+			// offsets are already encoded need no symbolic reference.
+			if !instruction.IsFunctionReference() || instruction.Constant != -1 {
+				continue
+			}
+			reference := instruction.Reference()
+			if _, found := symbols[reference]; reference == "" || !found {
+				t.Errorf("section %s instruction %d has unresolved function reference %q", program.SectionName, index, reference)
+			}
+		}
+	}
+}
