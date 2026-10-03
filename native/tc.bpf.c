@@ -179,6 +179,13 @@ struct sb_tc_assign_key {
 #define SB_SOCKET_CREATOR_VALID (1U << 0)
 #define SB_SOCKET_CREATOR_NAME_VALID (1U << 1)
 #define SB_SOCKET_CREATOR_EXE_VALID (1U << 2)
+// Set by the producer when the argv[0] it hashed may be a prefix of the real
+// process name: the string filled the whole argument block (zygote's setArgv0
+// strlcpy's into its original argv block, 99 or 78 bytes measured on the
+// device) or the 128-byte read buffer. Bits 8-15 hold the hashed byte count.
+// TC only copies these bits; userspace interprets them.
+#define SB_SOCKET_CREATOR_NAME_TRUNCATED (1U << 3)
+#define SB_SOCKET_CREATOR_NAME_LENGTH_SHIFT 8
 struct sb_socket_creator {
     __u64 cookie;
     __u64 start_time_ns;

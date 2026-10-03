@@ -36,7 +36,19 @@ const (
 	SocketCreatorValid     uint32 = 1 << 0
 	SocketCreatorNameValid uint32 = 1 << 1
 	SocketCreatorExeValid  uint32 = 1 << 2
+	// SocketCreatorNameTruncated marks a ProcessNameHash taken over a string
+	// that filled argv[0]'s whole argument block or the producer's read
+	// buffer, so it may cover only a prefix of the process name. Zygote's
+	// setArgv0 strlcpy's the name into its original argv block (99 or 78
+	// bytes on the test device). NameLength reports how many bytes were hashed.
+	SocketCreatorNameTruncated   uint32 = 1 << 3
+	socketCreatorNameLengthShift        = 8
 )
+
+// NameLength is the number of argv[0] bytes covered by ProcessNameHash.
+func (c SocketCreator) NameLength() int {
+	return int(c.Flags >> socketCreatorNameLengthShift & 0xff)
+}
 
 // HasProcessName reports whether ProcessNameHash was recorded.
 func (c SocketCreator) HasProcessName() bool {
