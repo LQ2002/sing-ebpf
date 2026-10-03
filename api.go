@@ -86,9 +86,13 @@ const (
 	TCPathDelivery       = core.TCPathDelivery
 
 	SocketCreatorValid       = core.SocketCreatorValid
+	SocketCreatorNameValid   = core.SocketCreatorNameValid
+	SocketCreatorExeValid    = core.SocketCreatorExeValid
 	TCIdentityUIDValid       = core.TCIdentityUIDValid
 	TCIdentityCgroupValid    = core.TCIdentityCgroupValid
 	TCIdentityCreatorChecked = core.TCIdentityCreatorChecked
+	TCIdentityChargeChecked  = core.TCIdentityChargeChecked
+	TCIdentityChargeValid    = core.TCIdentityChargeValid
 
 	TCLinkFramingUnsupported = core.TCLinkFramingUnsupported
 	TCLinkFramingEthernet    = core.TCLinkFramingEthernet
@@ -235,8 +239,12 @@ type TCConfig struct {
 	// SocketCreatorMap enables creation snapshots and socket identity in local
 	// assignments, independently of TrackProcess and RecordSocketIdentity.
 	// The caller owns this SK_STORAGE map and must keep it open until TC closes.
-	// Requires key=4, value=48, max_entries=0, flags=NO_PREALLOC (without CLONE).
-	SocketCreatorMap   *CiliumEBPF.Map
+	// Requires key=4, value=64, max_entries=0, flags=NO_PREALLOC (without CLONE).
+	SocketCreatorMap *CiliumEBPF.Map
+	// CookieTagMap optionally lends Android netd's cookie_tag_map (HASH,
+	// key=8, value=8) so local assignments carry each socket's charge UID.
+	// It requires SocketCreatorMap. The caller owns it.
+	CookieTagMap       *CiliumEBPF.Map
 	ICMPEchoReply      bool
 	AssignmentCapacity uint32
 }
@@ -261,6 +269,7 @@ func PrepareTC(config TCConfig) (*TCBackend, error) {
 		TrackProcess:         config.TrackProcess,
 		RecordSocketIdentity: config.RecordSocketIdentity,
 		SocketCreatorMap:     config.SocketCreatorMap,
+		CookieTagMap:         config.CookieTagMap,
 		ICMPEchoReply:        config.ICMPEchoReply,
 		AssignmentCapacity:   config.AssignmentCapacity,
 	}, config.SelfBypass)

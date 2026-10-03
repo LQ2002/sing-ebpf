@@ -317,8 +317,9 @@ func TestEmbeddedTCObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadTC, map[string]objectMapLayout{
 		"tc_control":          {4, 76},
 		"tc_listener_sockets": {4, 4},
-		"tc_assignment":       {44, 88},
-		"socket_creators":     {4, 48},
+		"tc_assignment":       {44, 112},
+		"socket_creators":     {4, 64},
+		"netd_cookie_tags":    {8, 8},
 		"tc_stats":            {4, 8},
 		// Socket local storage carries no key of its own: the socket is the
 		// key, so the kernel reports a key size of zero.
@@ -459,14 +460,22 @@ func TestTCSocketCreatorVariantIsolation(t *testing.T) {
 		if !selected {
 			continue
 		}
-		found := false
+		found, foundCharge := false, false
 		for _, ins := range program.Instructions {
-			if ins.Reference() == "socket_creators" {
+			switch ins.Reference() {
+			case "socket_creators":
 				found = true
+			case "netd_cookie_tags":
+				foundCharge = true
 			}
 		}
 		if found != want {
 			t.Errorf("section %s creator reference=%v, want %v", program.SectionName, found, want)
+		}
+		// The netd placeholder is only created for creator variants, so no
+		// other section may reference it.
+		if foundCharge != want {
+			t.Errorf("section %s cookie tag reference=%v, want %v", program.SectionName, foundCharge, want)
 		}
 		if want && (!programCallsHelper(program, asm.FnGetSocketCookie) || !programCallsHelper(program, asm.FnSkStorageGet)) {
 			t.Errorf("creator section %s lacks required socket helpers", program.SectionName)
@@ -477,7 +486,7 @@ func TestTCSocketCreatorVariantIsolation(t *testing.T) {
 		t.Fatalf("missing sections: %v", sections)
 	}
 	info := spec.Maps["socket_creators"]
-	if info == nil || info.Type != CiliumEBPF.SkStorage || info.KeySize != 4 || info.ValueSize != 48 || info.MaxEntries != 0 || info.Flags != bpfFlagNoPrealloc {
+	if info == nil || info.Type != CiliumEBPF.SkStorage || info.KeySize != 4 || info.ValueSize != 64 || info.MaxEntries != 0 || info.Flags != bpfFlagNoPrealloc {
 		t.Fatalf("bad creator map ABI: %+v", info)
 	}
 }

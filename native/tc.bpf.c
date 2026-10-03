@@ -87,6 +87,10 @@
 // Independent of UID/cgroup validity: a valid creator or a confirmed missing
 // entry from a full socket has been observed. Invalid non-null entries retry.
 #define SB_TC_IDENTITY_CREATOR_CHECKED (1U << 2)
+// The netd cookie tag lookup ran (CHECKED) and found an entry (VALID). Set
+// only by the creator variants, at the same moment the creator is first read.
+#define SB_TC_IDENTITY_CHARGE_CHECKED (1U << 3)
+#define SB_TC_IDENTITY_CHARGE_VALID (1U << 4)
 
 #define SB_TC_STAT_SOCKET_LOOKUP_FAILURE 0U
 #define SB_TC_STAT_SK_ASSIGN_FAILURE 1U
@@ -161,10 +165,20 @@ struct sb_tc_assign_key {
     __u8 destination_addr[16];
 };
 
-// Fixed shared ABI with the socket creator producer. The creator UID is never
-// replaced by the socket's mutable billing UID. No CLONE storage: a child
-// socket must acquire its own creation snapshot rather than inherit one.
+// Fixed shared ABI with the socket creator producer (v2, 64 bytes). The
+// creator UID is never replaced by the socket's mutable billing UID. No CLONE
+// storage: a child socket must acquire its own creation snapshot rather than
+// inherit one.
+//
+// v2 adds two creation-time facts so userspace needs no /proc read for them:
+// process_name_hash is FNV-1a 64 over the creating process's argv[0] (the
+// ActivityManager process record name: zygote's setArgV0 runs before any app
+// code), and exe_inode is the inode of its executable. Each has its own
+// validity bit because the producer cannot always read them (no mm for kernel
+// threads, a user-memory fault while reading argv).
 #define SB_SOCKET_CREATOR_VALID (1U << 0)
+#define SB_SOCKET_CREATOR_NAME_VALID (1U << 1)
+#define SB_SOCKET_CREATOR_EXE_VALID (1U << 2)
 struct sb_socket_creator {
     __u64 cookie;
     __u64 start_time_ns;
@@ -173,8 +187,12 @@ struct sb_socket_creator {
     __u32 user_id;
     __u32 flags;
     __u8 comm[16];
+    __u64 process_name_hash;
+    __u64 exe_inode;
 };
-_Static_assert(sizeof(struct sb_socket_creator) == 48, "sb_socket_creator ABI size");
+_Static_assert(sizeof(struct sb_socket_creator) == 64, "sb_socket_creator ABI size");
+_Static_assert(__builtin_offsetof(struct sb_socket_creator, process_name_hash) == 48, "creator name hash offset");
+_Static_assert(__builtin_offsetof(struct sb_socket_creator, exe_inode) == 56, "creator exe inode offset");
 _Static_assert(__builtin_offsetof(struct sb_socket_creator, cookie) == 0, "creator cookie offset");
 _Static_assert(__builtin_offsetof(struct sb_socket_creator, start_time_ns) == 8, "creator start offset");
 _Static_assert(__builtin_offsetof(struct sb_socket_creator, process_id) == 16, "creator pid offset");
@@ -209,6 +227,16 @@ struct sb_tc_assign_value {
     __u32 identity_flags;
     __u32 reserved;
     struct sb_socket_creator creator;
+    // netd's cookie_tag_map entry for this socket, read once together with the
+    // creator (SB_TC_IDENTITY_CHARGE_*). charge_uid is the UID netd bills the
+    // socket to. A service sending on an app's behalf (DownloadProvider, GMS)
+    // tags its socket with that app's UID; netd only accepts a charge UID that
+    // differs from the caller's when the caller holds UPDATE_DEVICE_STATS
+    // (Connectivity bpf/netd/BpfHandler.cpp tagSocket). It names the
+    // requester, never the sender, so userspace must not route by it. A tag
+    // applied after the first recorded packet is not seen.
+    __u32 charge_uid;
+    __u32 charge_tag;
 };
 
 _Static_assert(sizeof(struct sb_tc_control) == 76, "sb_tc_control ABI size");
@@ -243,7 +271,9 @@ union sb_tc_socket_verdict_word {
 _Static_assert(sizeof(union sb_tc_socket_verdict_word) == 8, "sb_tc_socket_verdict_word size");
 
 _Static_assert(sizeof(struct sb_tc_assign_key) == 44, "sb_tc_assign_key ABI size");
-_Static_assert(sizeof(struct sb_tc_assign_value) == 88, "sb_tc_assign_value ABI size");
+_Static_assert(sizeof(struct sb_tc_assign_value) == 112, "sb_tc_assign_value ABI size");
+_Static_assert(__builtin_offsetof(struct sb_tc_assign_value, charge_uid) == 104, "assignment charge uid offset");
+_Static_assert(__builtin_offsetof(struct sb_tc_assign_value, charge_tag) == 108, "assignment charge tag offset");
 _Static_assert(__builtin_offsetof(struct sb_tc_assign_value, creator) == 40, "assignment creator offset");
 _Static_assert(__builtin_offsetof(struct sb_tc_assign_value, socket_cookie) == 0,
     "sb_tc_assign_value socket_cookie ABI offset");
@@ -337,6 +367,17 @@ struct bpf_map_def SEC("maps") socket_creators = {
     .max_entries = 0U,
     .map_flags = 1U, // BPF_F_NO_PREALLOC, explicitly without BPF_F_CLONE.
 };
+// netd's cookie_tag_map layout (Connectivity bpf/netd: HASH, key u64 socket
+// cookie, value UidTagValue{u32 uid; u32 tag}). Referenced only by the creator
+// variants. The loader replaces it with the pinned netd map when one is
+// supplied and otherwise binds an empty one-entry placeholder, so a lookup
+// simply misses and the charge stays unknown.
+struct sb_netd_uid_tag {
+    __u32 uid;
+    __u32 tag;
+};
+_Static_assert(sizeof(struct sb_netd_uid_tag) == 8, "netd UidTagValue size");
+MAP(netd_cookie_tags, __u64, struct sb_netd_uid_tag, BPF_MAP_TYPE_HASH, 1U);
 // tc_self_sockets 不是普通哈希表，而是挂在 socket 本身上的本地存储。
 // 这样做的理由是回收：按 socket cookie 索引的哈希表没有任何东西在 socket
 // 关闭时删除对应条目（用户态注册路径尤其如此，见 internal/core/self_bypass.go
@@ -870,7 +911,7 @@ INLINE bool source_mac_equal(const __u8 left[6], const __u8 right[6]) {
     return left_low == right_low && left_high == right_high;
 }
 
-// Avoid memcmp: Clang may emit an unresolved libc call for the 48-byte ABI.
+// Avoid memcmp: Clang may emit an unresolved libc call for the 64-byte ABI.
 // Fold scalar differences into one word so comparison stays native BPF; the
 // fixed-width memcpy loads also avoid alignment/aliasing assumptions on comm.
 INLINE bool socket_creator_equal(const struct sb_socket_creator *left, const struct sb_socket_creator *right) {
@@ -887,6 +928,8 @@ INLINE bool socket_creator_equal(const struct sb_socket_creator *left, const str
     different |= left->flags ^ right->flags;
     different |= left_comm_low ^ right_comm_low;
     different |= left_comm_high ^ right_comm_high;
+    different |= left->process_name_hash ^ right->process_name_hash;
+    different |= left->exe_inode ^ right->exe_inode;
     return different == 0U;
 }
 // build_assignment 填好 assign_socket 系列要写的值，并报告它与现有条目是否不同。
@@ -908,12 +951,15 @@ INLINE bool build_assignment(struct sb_tc_assign_value *value, const struct sb_t
         value->socket_cgroup_id = existing->socket_cgroup_id;
         value->identity_flags = existing->identity_flags;
         value->creator = existing->creator;
+        value->charge_uid = existing->charge_uid;
+        value->charge_tag = existing->charge_tag;
     }
     if (existing == 0) return true;
     if (existing->socket_cookie != value->socket_cookie || existing->ifindex != value->ifindex ||
         existing->path != value->path || existing->source_mac_valid != value->source_mac_valid ||
         existing->socket_uid != value->socket_uid || existing->socket_cgroup_id != value->socket_cgroup_id ||
         existing->identity_flags != value->identity_flags ||
+        existing->charge_uid != value->charge_uid || existing->charge_tag != value->charge_tag ||
         !socket_creator_equal(&existing->creator, &value->creator)) return true;
     return source_mac_valid && !source_mac_equal(existing->source_mac, value->source_mac);
 }
@@ -1055,6 +1101,12 @@ INLINE void record_local_socket(struct __sk_buff *skb, const struct sb_tc_assign
 // hook has already run, so old sockets cannot gain a creation record later.
 // Non-full sockets and invalid non-null entries are retried. fchown refreshes
 // billing UID independently; a new cookie always starts from zero.
+//
+// netd's cookie tag is looked up once per cookie on the first packet that
+// carries a full socket, and a miss is cached like a missing creator. Apps and
+// services tag before connecting (TrafficStats.tagSocket), so the SYN already
+// sees the tag; a retag later in the socket's life is deliberately not
+// followed because the steady path must stay free of extra lookups.
 INLINE void record_local_socket_creator(struct __sk_buff *skb, const struct sb_tc_assign_key *key) {
     __u64 cookie = get_socket_cookie(skb);
     if (cookie == 0U) return;
@@ -1070,8 +1122,9 @@ INLINE void record_local_socket_creator(struct __sk_buff *skb, const struct sb_t
         value.socket_uid != uid;
     bool read_creator = !socket_creator_valid(&value.creator, cookie) &&
         (value.identity_flags & SB_TC_IDENTITY_CREATOR_CHECKED) == 0U;
+    bool read_charge = (value.identity_flags & SB_TC_IDENTITY_CHARGE_CHECKED) == 0U;
     __u64 cgroup_id = 0U;
-    if (read_identity || read_creator) {
+    if (read_identity || read_creator || read_charge) {
         // Only this packet's helper result proves it currently carries a full
         // socket. A saved cgroup ID cannot prove that for TIME_WAIT packets.
         cgroup_id = skb_cgroup_id(skb);
@@ -1092,6 +1145,16 @@ INLINE void record_local_socket_creator(struct __sk_buff *skb, const struct sb_t
             value.identity_flags |= SB_TC_IDENTITY_CREATOR_CHECKED;
             changed = true;
         }
+    }
+    if (read_charge && cgroup_id != 0U) {
+        const struct sb_netd_uid_tag *charge = map_lookup(&netd_cookie_tags, &cookie);
+        value.identity_flags |= SB_TC_IDENTITY_CHARGE_CHECKED;
+        if (charge != 0) {
+            value.charge_uid = charge->uid;
+            value.charge_tag = charge->tag;
+            value.identity_flags |= SB_TC_IDENTITY_CHARGE_VALID;
+        }
+        changed = true;
     }
     if (changed) map_update(&tc_assignment, key, &value, BPF_ANY);
 }

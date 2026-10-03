@@ -46,7 +46,10 @@ func socketCreatorTestRecord(t *testing.T, fd int, generation uint32) SocketCrea
 	creator := SocketCreator{
 		Cookie: socketCookie(t, fd), StartTimeNs: 1000000000 + uint64(generation),
 		ProcessID: uint32(os.Getpid()), ThreadID: uint32(unix.Gettid()),
-		UserID: 0, Flags: SocketCreatorValid,
+		UserID: 0, Flags: SocketCreatorValid | SocketCreatorNameValid | SocketCreatorExeValid,
+		// v2 tail: nonzero, per-generation values so a dropped or truncated
+		// copy of the last 16 bytes fails the whole-struct comparison.
+		ProcessNameHash: 0xcbf29ce484222325 ^ uint64(generation), ExeInode: 4242 + uint64(generation),
 	}
 	copy(creator.Comm[:], fmt.Sprintf("creator-%d", generation))
 	return creator
@@ -370,8 +373,10 @@ func TestTCSocketCreatorRejectsWrongMapBeforeLoading(t *testing.T) {
 		return nil, errors.New("unexpected TC object load for invalid creator map")
 	}
 	for _, spec := range []*CiliumEBPF.MapSpec{
-		{Name: "sb_bad_hash", Type: CiliumEBPF.Hash, KeySize: 4, ValueSize: 48, MaxEntries: 1},
+		{Name: "sb_bad_hash", Type: CiliumEBPF.Hash, KeySize: 4, ValueSize: 64, MaxEntries: 1},
 		{Name: "sb_bad_storage", Type: CiliumEBPF.SkStorage, KeySize: 4, ValueSize: 40, Flags: bpfFlagNoPrealloc},
+		// A v1 producer's 48-byte map must not be read as v2.
+		{Name: "sb_v1_storage", Type: CiliumEBPF.SkStorage, KeySize: 4, ValueSize: 48, Flags: bpfFlagNoPrealloc},
 	} {
 		if spec.Type == CiliumEBPF.SkStorage {
 			describeLocalStorageTypes(spec)
@@ -402,6 +407,130 @@ func TestTCSocketCreatorRejectsWrongMapBeforeLoading(t *testing.T) {
 		got := make([]byte, spec.ValueSize)
 		if err := creatorMap.Lookup(&key, &got); err != nil || !bytes.Equal(got, value) {
 			t.Fatalf("%s rejection closed or modified caller map: %x, %v", spec.Name, got, err)
+		}
+	}
+}
+
+// netdUIDTag mirrors netd's UidTagValue (Connectivity bpf/netd).
+type netdUIDTag struct {
+	UID uint32
+	Tag uint32
+}
+
+func newCookieTagTestMap(t *testing.T) *CiliumEBPF.Map {
+	t.Helper()
+	// Same layout as /sys/fs/bpf/netd_shared/map_netd_cookie_tag_map.
+	tagMap, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+		Name: "sb_test_ctag", Type: CiliumEBPF.Hash, KeySize: 8, ValueSize: 8, MaxEntries: 16,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tagMap.Close() })
+	return tagMap
+}
+
+func TestTCSocketCreatorRecordsNetdCharge(t *testing.T) {
+	creatorMap := newSocketCreatorTestMap(t)
+	tagMap := newCookieTagTestMap(t)
+	f := newIdentityFixtureWithMaps(t, true, creatorMap, tagMap, uidIncluded)
+
+	tagged := newSocketCreatorTestSocket(t, unix.SOCK_DGRAM, uidIncluded, netip.AddrPort{})
+	taggedFD := int(tagged.Fd())
+	creator := socketCreatorTestRecord(t, taggedFD, 1)
+	setSocketCreatorTestRecord(t, creatorMap, taggedFD, creator)
+	cookie := creator.Cookie
+	if err := tagMap.Update(&cookie, &netdUIDTag{UID: 10123, Tag: 7}, CiliumEBPF.UpdateAny); err != nil {
+		t.Fatal(err)
+	}
+	assignment := sendSocketCreatorTestUDP(t, f, taggedFD)
+	requireSocketCreatorAssignment(t, assignment, creator)
+	if !assignment.HasCharge() || assignment.IdentityFlags&TCIdentityChargeChecked == 0 ||
+		assignment.ChargeUID != 10123 || assignment.ChargeTag != 7 {
+		t.Fatalf("netd charge not recorded: %+v", assignment)
+	}
+	// Read once per cookie: a retag after the first packet is not followed.
+	if err := tagMap.Update(&cookie, &netdUIDTag{UID: 10999, Tag: 8}, CiliumEBPF.UpdateAny); err != nil {
+		t.Fatal(err)
+	}
+	if assignment = sendSocketCreatorTestUDP(t, f, taggedFD); assignment.ChargeUID != 10123 || assignment.ChargeTag != 7 {
+		t.Fatalf("charge re-read on the steady path: %+v", assignment)
+	}
+
+	untagged := newSocketCreatorTestSocket(t, unix.SOCK_DGRAM, uidIncluded, netip.AddrPort{})
+	untaggedFD := int(untagged.Fd())
+	assignment = sendSocketCreatorTestUDP(t, f, untaggedFD)
+	if assignment.HasCharge() || assignment.IdentityFlags&TCIdentityChargeChecked == 0 || assignment.ChargeUID != 0 {
+		t.Fatalf("untagged socket charge: %+v", assignment)
+	}
+	var left netdUIDTag
+	if err := tagMap.Lookup(&cookie, &left); err != nil || left.UID != 10999 {
+		t.Fatalf("TC modified the borrowed cookie tag map: %+v, %v", left, err)
+	}
+}
+
+func TestTCSocketCreatorPlaceholderChargeIsCheckedOnly(t *testing.T) {
+	creatorMap := newSocketCreatorTestMap(t)
+	f := newIdentityFixtureWithCreator(t, true, creatorMap, uidIncluded)
+	socket := newSocketCreatorTestSocket(t, unix.SOCK_DGRAM, uidIncluded, netip.AddrPort{})
+	assignment := sendSocketCreatorTestUDP(t, f, int(socket.Fd()))
+	if assignment.HasCharge() || assignment.IdentityFlags&TCIdentityChargeChecked == 0 {
+		t.Fatalf("placeholder charge: %+v", assignment)
+	}
+}
+
+func TestTCSocketCreatorBorrowedCookieTagMapSurvivesBackend(t *testing.T) {
+	creatorMap := newSocketCreatorTestMap(t)
+	tagMap := newCookieTagTestMap(t)
+	key, want := uint64(99), netdUIDTag{UID: 10123, Tag: 1}
+	if err := tagMap.Update(&key, &want, CiliumEBPF.UpdateAny); err != nil {
+		t.Fatal(err)
+	}
+	backend, err := PrepareTC(TCConfig{
+		ListenerPort: 65531, EnableLocal: true, EnableIPv4: true,
+		EnableUDP: true, SocketCreatorMap: creatorMap, CookieTagMap: tagMap,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = backend.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var got netdUIDTag
+	if err = tagMap.Lookup(&key, &got); err != nil || got != want {
+		t.Fatalf("borrowed cookie tag map lost after backend cleanup: %+v, %v", got, err)
+	}
+}
+
+func TestTCSocketCreatorRejectsWrongCookieTagMap(t *testing.T) {
+	creatorMap := newSocketCreatorTestMap(t)
+	originalLoadTC := loadTC
+	defer func() { loadTC = originalLoadTC }()
+	loadCalls := 0
+	loadTC = func() (*CiliumEBPF.CollectionSpec, error) {
+		loadCalls++
+		return nil, errors.New("unexpected TC object load for invalid cookie tag map")
+	}
+	bad, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+		Name: "sb_bad_ctag", Type: CiliumEBPF.Hash, KeySize: 8, ValueSize: 4, MaxEntries: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bad.Close()
+	good := newCookieTagTestMap(t)
+	for name, config := range map[string]TCConfig{
+		"wrong layout": {SocketCreatorMap: creatorMap, CookieTagMap: bad},
+		"no creator":   {CookieTagMap: good},
+	} {
+		config.ListenerPort, config.EnableLocal, config.EnableIPv4, config.EnableUDP = 65531, true, true, true
+		backend, err := PrepareTC(config)
+		if backend != nil {
+			_ = backend.Close()
+			t.Fatalf("%s: accepted", name)
+		}
+		if err == nil || loadCalls != 0 {
+			t.Fatalf("%s: rejection = %v after %d object loads", name, err, loadCalls)
 		}
 	}
 }
