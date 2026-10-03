@@ -29,7 +29,7 @@ func TestTCABI(t *testing.T) {
 	}
 	// Mirrors the _Static_asserts on struct sb_tc_assign_value in
 	// native/tc.bpf.c; TestEmbeddedTCObjectLayout checks the compiled map.
-	if size := unsafe.Sizeof(TCAssignment{}); size != 88 {
+	if size := unsafe.Sizeof(TCAssignment{}); size != 112 {
 		t.Fatalf("unexpected TC assignment value size: %d", size)
 	}
 	for name, offsets := range map[string][2]uintptr{
@@ -43,6 +43,8 @@ func TestTCABI(t *testing.T) {
 		"IdentityFlags":  {unsafe.Offsetof(TCAssignment{}.IdentityFlags), 32},
 		"Reserved":       {unsafe.Offsetof(TCAssignment{}.Reserved), 36},
 		"Creator":        {unsafe.Offsetof(TCAssignment{}.Creator), 40},
+		"ChargeUID":      {unsafe.Offsetof(TCAssignment{}.ChargeUID), 104},
+		"ChargeTag":      {unsafe.Offsetof(TCAssignment{}.ChargeTag), 108},
 	} {
 		if offsets[0] != offsets[1] {
 			t.Fatalf("unexpected TC assignment %s offset: %d, want %d", name, offsets[0], offsets[1])

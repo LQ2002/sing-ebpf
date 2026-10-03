@@ -106,7 +106,13 @@ type TCConfig struct {
 	// local TC records socket identity and copies the immutable creator snapshot
 	// into assignments, independently of TrackProcess and RecordSocketIdentity.
 	// The caller keeps it open until Close; TC never closes or creates it.
-	SocketCreatorMap   *CiliumEBPF.Map
+	SocketCreatorMap *CiliumEBPF.Map
+	// CookieTagMap is Android netd's cookie_tag_map, borrowed read-only by the
+	// creator variants to record each socket's charge UID once (see
+	// TCAssignment.ChargeUID). It requires SocketCreatorMap. When nil, an
+	// empty placeholder is bound instead, so every charge is checked but never
+	// valid. The caller keeps it open until Close; TC never closes or writes it.
+	CookieTagMap       *CiliumEBPF.Map
 	AssignmentCapacity uint32
 	// ICMPEchoReply loads the independent icmp_echo_reply object (see
 	// tc_icmp_echo_reply.go) and attaches it wherever this TC data plane already
@@ -175,6 +181,17 @@ type TCAssignment struct {
 	IdentityFlags  uint32
 	Reserved       uint32
 	Creator        SocketCreator
+	// ChargeUID and ChargeTag copy netd's cookie_tag_map entry, read once on
+	// the first full-socket packet. ChargeUID names the app the traffic is
+	// billed to (the requester), not the process that sent it; never route
+	// by it. Valid only with TCIdentityChargeValid.
+	ChargeUID uint32
+	ChargeTag uint32
+}
+
+// HasCharge reports whether netd's cookie tag entry was found for this socket.
+func (a TCAssignment) HasCharge() bool {
+	return a.IdentityFlags&TCIdentityChargeValid != 0
 }
 
 // HasSocketCreator reports a complete creator snapshot for this exact socket.
@@ -189,6 +206,11 @@ const (
 	// entry on a full socket. It is independent of UID/cgroup validity and
 	// does not by itself prove a creator was recorded; use HasSocketCreator.
 	TCIdentityCreatorChecked uint32 = 1 << 2
+	// TCIdentityChargeChecked marks that netd's cookie tag map was consulted;
+	// TCIdentityChargeValid that it held an entry. Without Checked, the
+	// absence of a charge is not evidence of anything.
+	TCIdentityChargeChecked uint32 = 1 << 3
+	TCIdentityChargeValid   uint32 = 1 << 4
 )
 
 // HasSocketIdentity reports whether the local egress path recorded the
@@ -213,6 +235,7 @@ type TCBackend struct {
 	assignmentMapFD    int
 	selfMapExternal    bool
 	creatorMapExternal bool
+	cookieTagExternal  bool
 	bypassIPv4         []netip.Prefix
 	bypassIPv6         []netip.Prefix
 	sharedBypassIPv4   []netip.Prefix
@@ -255,6 +278,14 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 			return nil, E.New("socket creator map requires the TC local path")
 		}
 		if err := validateSocketCreatorMap(config.SocketCreatorMap); err != nil {
+			return nil, err
+		}
+	}
+	if config.CookieTagMap != nil {
+		if config.SocketCreatorMap == nil {
+			return nil, E.New("cookie tag map requires the socket creator map")
+		}
+		if err := validateCookieTagMap(config.CookieTagMap); err != nil {
 			return nil, err
 		}
 	}
@@ -376,6 +407,7 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		assignmentMapFD:    maps["tc_assignment"].FD(),
 		selfMapExternal:    config.EnableLocal && config.SelfBypassMap != nil,
 		creatorMapExternal: config.SocketCreatorMap != nil,
+		cookieTagExternal:  config.SocketCreatorMap != nil && config.CookieTagMap != nil,
 		uidEntries:         slices.Clone(uidEntries),
 		uidDefaultBypass:   policy.uidDefaultBypass,
 	}
@@ -425,9 +457,22 @@ func loadTCResources(config TCConfig, baseOverrides map[string]mapSpecOverride, 
 			return nil, nil, err
 		}
 	}
-	mapOverrides := make(map[string]mapSpecOverride, len(baseOverrides))
+	if config.CookieTagMap != nil {
+		if err := validateCookieTagMap(config.CookieTagMap); err != nil {
+			return nil, nil, err
+		}
+	}
+	mapOverrides := make(map[string]mapSpecOverride, len(baseOverrides)+1)
 	for name, override := range baseOverrides {
 		mapOverrides[name] = override
+	}
+	if config.SocketCreatorMap != nil && config.CookieTagMap == nil {
+		// The creator variants always reference netd_cookie_tags. Without
+		// netd's map an empty one-entry placeholder satisfies the reference;
+		// every lookup misses, so charges are checked but never valid.
+		mapOverrides["netd_cookie_tags"] = mapSpecOverride{
+			name: "sb_tc_netdtag", mapType: CiliumEBPF.Hash, maxEntries: 1,
+		}
 	}
 	if legacyTCP {
 		delete(mapOverrides, "tc_listener_sockets")
@@ -444,6 +489,9 @@ func loadTCResources(config TCConfig, baseOverrides map[string]mapSpecOverride, 
 	}
 	if config.SocketCreatorMap != nil {
 		maps["socket_creators"] = config.SocketCreatorMap
+		if config.CookieTagMap != nil {
+			maps["netd_cookie_tags"] = config.CookieTagMap
+		}
 	}
 	selections := make([]programSelection, 0, tcProgramCount)
 	programIndexes := make([]int, 0, tcProgramCount)
@@ -499,6 +547,9 @@ func loadTCResources(config TCConfig, baseOverrides map[string]mapSpecOverride, 
 			delete(maps, "tc_self_sockets")
 		}
 		delete(maps, "socket_creators")
+		if config.CookieTagMap != nil {
+			delete(maps, "netd_cookie_tags")
+		}
 		// closeMaps closing something here does not mean the map it held is
 		// actually gone — the same caveat as backend.Close() above — but a
 		// failure out of it is still worth reporting alongside the load failure
@@ -1108,6 +1159,9 @@ func (b *TCBackend) Close() error {
 	if b.creatorMapExternal {
 		delete(b.runtime.maps, "socket_creators")
 	}
+	if b.cookieTagExternal {
+		delete(b.runtime.maps, "netd_cookie_tags")
+	}
 	closeErr := closeObjectResources(b.runtime.programs, b.runtime.maps)
 	closeErr = E.Errors(closeErr, b.icmpEchoReply.Close())
 	b.icmpEchoReply = nil
@@ -1116,6 +1170,7 @@ func (b *TCBackend) Close() error {
 	b.assignmentMapFD = -1
 	b.selfMapExternal = false
 	b.creatorMapExternal = false
+	b.cookieTagExternal = false
 	b.bypassIPv4 = nil
 	b.bypassIPv6 = nil
 	b.sharedBypassIPv4 = nil

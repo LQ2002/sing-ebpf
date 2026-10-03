@@ -16,6 +16,7 @@ import (
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
+	TCMapNetdCookieTags                         = "netd_cookie_tags"
 	TCMapSocketCreators                         = "socket_creators"
 	TCMapTcAssignment                           = "tc_assignment"
 	TCMapTcControl                              = "tc_control"
@@ -118,6 +119,7 @@ type TCProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type TCMapSpecs struct {
+	NetdCookieTags      *ebpf.MapSpec `ebpf:"netd_cookie_tags"`
 	SocketCreators      *ebpf.MapSpec `ebpf:"socket_creators"`
 	TcAssignment        *ebpf.MapSpec `ebpf:"tc_assignment"`
 	TcControl           *ebpf.MapSpec `ebpf:"tc_control"`
@@ -168,6 +170,7 @@ func (o *TCObjects) Close() error {
 //
 // It can be passed to LoadTCObjects or ebpf.CollectionSpec.LoadAndAssign.
 type TCMaps struct {
+	NetdCookieTags      *ebpf.Map `ebpf:"netd_cookie_tags"`
 	SocketCreators      *ebpf.Map `ebpf:"socket_creators"`
 	TcAssignment        *ebpf.Map `ebpf:"tc_assignment"`
 	TcControl           *ebpf.Map `ebpf:"tc_control"`
@@ -194,6 +197,7 @@ type TCMaps struct {
 
 func (m *TCMaps) Close() error {
 	return _TCClose(
+		m.NetdCookieTags,
 		m.SocketCreators,
 		m.TcAssignment,
 		m.TcControl,
