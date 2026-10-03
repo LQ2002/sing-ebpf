@@ -109,6 +109,10 @@ func TestSocketCreatorOptionalFields(t *testing.T) {
 	if creator.HasProcessName() || !creator.HasExecutable() {
 		t.Fatal("exe flag not independent")
 	}
+	creator.Flags = SocketCreatorValid | SocketCreatorNameValid | SocketCreatorNameTruncated | 77<<8
+	if creator.NameLength() != 77 || !creator.HasProcessName() {
+		t.Fatalf("name length %d", creator.NameLength())
+	}
 }
 
 func TestCookieTagMapLayoutValidation(t *testing.T) {
