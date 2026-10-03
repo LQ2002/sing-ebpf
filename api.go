@@ -86,6 +86,9 @@ const (
 	TCPathShared         = core.TCPathShared
 	TCPathDelivery       = core.TCPathDelivery
 
+	TCIdentityUIDValid    = core.TCIdentityUIDValid
+	TCIdentityCgroupValid = core.TCIdentityCgroupValid
+
 	TCLinkFramingUnsupported = core.TCLinkFramingUnsupported
 	TCLinkFramingEthernet    = core.TCLinkFramingEthernet
 	TCLinkFramingRawIP       = core.TCLinkFramingRawIP
@@ -227,21 +230,24 @@ func AttachProcessTracker(config ProcessTrackerConfig) (*ProcessTracker, error) 
 }
 
 type TCConfig struct {
-	ListenerPort       uint16
-	EnableLocal        bool
-	EnableShared       bool
-	EnableIPv4         bool
-	EnableLocalIPv6    bool
-	EnableSharedIPv6   bool
-	EnableTCP          bool
-	EnableUDP          bool
-	DeliveryInterface  uint32
-	Policy             CompiledPolicy
-	RoutingMark        uint32
-	SelfBypass         *SelfBypass
-	TrackProcess       bool
-	ICMPEchoReply      bool
-	AssignmentCapacity uint32
+	ListenerPort      uint16
+	EnableLocal       bool
+	EnableShared      bool
+	EnableIPv4        bool
+	EnableLocalIPv6   bool
+	EnableSharedIPv6  bool
+	EnableTCP         bool
+	EnableUDP         bool
+	DeliveryInterface uint32
+	Policy            CompiledPolicy
+	RoutingMark       uint32
+	SelfBypass        *SelfBypass
+	TrackProcess      bool
+	// RecordSocketIdentity makes the local path record the sending socket's
+	// UID and cgroup id in each assignment, independently of TrackProcess.
+	RecordSocketIdentity bool
+	ICMPEchoReply        bool
+	AssignmentCapacity   uint32
 }
 
 type TCBackend struct {
@@ -250,20 +256,21 @@ type TCBackend struct {
 
 func PrepareTC(config TCConfig) (*TCBackend, error) {
 	backend, err := core.PrepareTCWithSelfBypass(core.TCConfig{
-		ListenerPort:       config.ListenerPort,
-		EnableLocal:        config.EnableLocal,
-		EnableShared:       config.EnableShared,
-		EnableIPv4:         config.EnableIPv4,
-		EnableLocalIPv6:    config.EnableLocalIPv6,
-		EnableSharedIPv6:   config.EnableSharedIPv6,
-		EnableTCP:          config.EnableTCP,
-		EnableUDP:          config.EnableUDP,
-		DeliveryInterface:  config.DeliveryInterface,
-		Policy:             config.Policy,
-		RoutingMark:        config.RoutingMark,
-		TrackProcess:       config.TrackProcess,
-		ICMPEchoReply:      config.ICMPEchoReply,
-		AssignmentCapacity: config.AssignmentCapacity,
+		ListenerPort:         config.ListenerPort,
+		EnableLocal:          config.EnableLocal,
+		EnableShared:         config.EnableShared,
+		EnableIPv4:           config.EnableIPv4,
+		EnableLocalIPv6:      config.EnableLocalIPv6,
+		EnableSharedIPv6:     config.EnableSharedIPv6,
+		EnableTCP:            config.EnableTCP,
+		EnableUDP:            config.EnableUDP,
+		DeliveryInterface:    config.DeliveryInterface,
+		Policy:               config.Policy,
+		RoutingMark:          config.RoutingMark,
+		TrackProcess:         config.TrackProcess,
+		RecordSocketIdentity: config.RecordSocketIdentity,
+		ICMPEchoReply:        config.ICMPEchoReply,
+		AssignmentCapacity:   config.AssignmentCapacity,
 	}, config.SelfBypass)
 	if err != nil {
 		return nil, err
@@ -330,6 +337,20 @@ func (b *TCBackend) UpdateSharedDestinationDecisions(decisions []CIDRDecision) (
 	}
 	return backend.UpdateSharedDestinationDecisions(decisions)
 }
+
+// UpdateUIDPolicy replaces the local path's UID decisions on a running
+// backend without rebuilding it. The inputs mean what ActionScope.UID and
+// ActionScope.Default mean at startup. It reports whether anything changed.
+// The update is applied entry by entry, not atomically; see the core
+// implementation for the transition guarantees.
+func (b *TCBackend) UpdateUIDPolicy(decisions []UIDDecision, defaultAction Decision) (bool, error) {
+	backend := core.UnwrapTCBackend(b)
+	if backend == nil {
+		return false, errors.New("uninitialized TC eBPF backend")
+	}
+	return backend.UpdateUIDPolicy(decisions, defaultAction)
+}
+
 func (b *TCBackend) TCPListenerLookupMode() string {
 	return core.UnwrapTCBackend(b).TCPListenerLookupMode()
 }

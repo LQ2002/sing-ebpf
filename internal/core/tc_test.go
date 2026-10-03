@@ -27,14 +27,28 @@ func TestTCABI(t *testing.T) {
 	if size := unsafe.Sizeof(tcAssignKey{}); size != 44 {
 		t.Fatalf("unexpected TC assignment key size: %d", size)
 	}
-	if size := unsafe.Sizeof(TCAssignment{}); size != 24 {
+	// Mirrors the _Static_asserts on struct sb_tc_assign_value in
+	// native/tc.bpf.c; TestEmbeddedTCObjectLayout checks the compiled map.
+	if size := unsafe.Sizeof(TCAssignment{}); size != 40 {
 		t.Fatalf("unexpected TC assignment value size: %d", size)
 	}
-	if offset := unsafe.Offsetof(TCAssignment{}.SocketCookie); offset != 0 {
-		t.Fatalf("unexpected TC assignment socket cookie offset: %d", offset)
+	for name, offsets := range map[string][2]uintptr{
+		"SocketCookie":   {unsafe.Offsetof(TCAssignment{}.SocketCookie), 0},
+		"InterfaceIndex": {unsafe.Offsetof(TCAssignment{}.InterfaceIndex), 8},
+		"SourceMAC":      {unsafe.Offsetof(TCAssignment{}.SourceMAC), 12},
+		"Path":           {unsafe.Offsetof(TCAssignment{}.Path), 18},
+		"SourceMACValid": {unsafe.Offsetof(TCAssignment{}.SourceMACValid), 19},
+		"SocketUID":      {unsafe.Offsetof(TCAssignment{}.SocketUID), 20},
+		"SocketCgroupID": {unsafe.Offsetof(TCAssignment{}.SocketCgroupID), 24},
+		"IdentityFlags":  {unsafe.Offsetof(TCAssignment{}.IdentityFlags), 32},
+		"Reserved":       {unsafe.Offsetof(TCAssignment{}.Reserved), 36},
+	} {
+		if offsets[0] != offsets[1] {
+			t.Fatalf("unexpected TC assignment %s offset: %d, want %d", name, offsets[0], offsets[1])
+		}
 	}
-	if offset := unsafe.Offsetof(TCAssignment{}.InterfaceIndex); offset != 8 {
-		t.Fatalf("unexpected TC assignment interface index offset: %d", offset)
+	if flags := (policyVector{UIDPolicy: true, UIDDefaultBypass: true}).tcFlags(); flags != tcFlagUIDPolicy|tcFlagUIDDefaultBypass {
+		t.Fatalf("UID flag constants disagree with the policy vector: %#x", flags)
 	}
 }
 
