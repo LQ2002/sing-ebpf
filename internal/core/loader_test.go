@@ -190,6 +190,8 @@ func TestTCLocalProgramsDoNotUseTGIDHelper(t *testing.T) {
 		"classifier/local_egress_raw_ip_mark",
 		"classifier/local_egress_ethernet_process",
 		"classifier/local_egress_raw_ip_process",
+		"classifier/local_egress_ethernet_creator",
+		"classifier/local_egress_raw_ip_creator",
 	} {
 		for _, program := range spec.Programs {
 			if program.SectionName != section {
@@ -231,6 +233,8 @@ func TestTCLocalProgramsReadSelfBypassStorage(t *testing.T) {
 		"classifier/local_egress_raw_ip_mark":      false,
 		"classifier/local_egress_ethernet_process": true,
 		"classifier/local_egress_raw_ip_process":   true,
+		"classifier/local_egress_ethernet_creator": true,
+		"classifier/local_egress_raw_ip_creator":   true,
 	}
 	for _, program := range spec.Programs {
 		wantCookie, selected := sections[program.SectionName]
@@ -268,6 +272,8 @@ func TestTCLocalProgramsCacheTheirVerdict(t *testing.T) {
 		"classifier/local_egress_raw_ip_mark",
 		"classifier/local_egress_ethernet_process",
 		"classifier/local_egress_raw_ip_process",
+		"classifier/local_egress_ethernet_creator",
+		"classifier/local_egress_raw_ip_creator",
 	}
 	for _, section := range sections {
 		var program *CiliumEBPF.ProgramSpec
@@ -337,7 +343,8 @@ func TestEmbeddedTCObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadTC, map[string]objectMapLayout{
 		"tc_control":          {4, 76},
 		"tc_listener_sockets": {4, 4},
-		"tc_assignment":       {44, 40},
+		"tc_assignment":       {44, 88},
+		"socket_creators":     {4, 48},
 		"tc_stats":            {4, 8},
 		// Socket local storage carries no key of its own: the socket is the
 		// key, so the kernel reports a key size of zero.
@@ -363,6 +370,8 @@ func TestEmbeddedTCObjectLayout(t *testing.T) {
 		"classifier/local_egress_raw_ip_mark",
 		"classifier/local_egress_ethernet_process",
 		"classifier/local_egress_raw_ip_process",
+		"classifier/local_egress_ethernet_creator",
+		"classifier/local_egress_raw_ip_creator",
 		"classifier/shared_ingress_ethernet",
 		"classifier/shared_ingress_raw_ip",
 		"classifier/delivery_ingress",
@@ -453,5 +462,48 @@ func TestKernelProgramNames(t *testing.T) {
 			t.Fatalf("duplicate kernel program name: %s", name)
 		}
 		seen[name] = struct{}{}
+	}
+}
+
+// Legacy mark/process variants must not reference creator storage. Referenced
+// map symbols survive bpf2go relocation and expose accidental shared call paths.
+func TestTCSocketCreatorVariantIsolation(t *testing.T) {
+	spec, err := loadTC()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sections := map[string]bool{
+		"classifier/local_egress_ethernet_mark":    false,
+		"classifier/local_egress_raw_ip_mark":      false,
+		"classifier/local_egress_ethernet_process": false,
+		"classifier/local_egress_raw_ip_process":   false,
+		"classifier/local_egress_ethernet_creator": true,
+		"classifier/local_egress_raw_ip_creator":   true,
+	}
+	for _, program := range spec.Programs {
+		want, selected := sections[program.SectionName]
+		if !selected {
+			continue
+		}
+		found := false
+		for _, ins := range program.Instructions {
+			if ins.Reference() == "socket_creators" {
+				found = true
+			}
+		}
+		if found != want {
+			t.Errorf("section %s creator reference=%v, want %v", program.SectionName, found, want)
+		}
+		if want && (!programCallsHelper(program, asm.FnGetSocketCookie) || !programCallsHelper(program, asm.FnSkStorageGet)) {
+			t.Errorf("creator section %s lacks required socket helpers", program.SectionName)
+		}
+		delete(sections, program.SectionName)
+	}
+	if len(sections) != 0 {
+		t.Fatalf("missing sections: %v", sections)
+	}
+	info := spec.Maps["socket_creators"]
+	if info == nil || info.Type != CiliumEBPF.SkStorage || info.KeySize != 4 || info.ValueSize != 48 || info.MaxEntries != 0 || info.Flags != bpfFlagNoPrealloc {
+		t.Fatalf("bad creator map ABI: %+v", info)
 	}
 }

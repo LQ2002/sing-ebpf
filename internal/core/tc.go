@@ -97,10 +97,15 @@ type TCConfig struct {
 	// sending socket's cookie, UID and cgroup id into each assignment (see
 	// TCAssignment). It is independent of TrackProcess, which the old
 	// ProcessTracker sets for the cookie alone; either one selects the same
-	// variant, and leaving both false keeps the lighter variant that calls no
-	// identity helper at all.
+	// variant. With neither set and SocketCreatorMap nil, the lighter variant
+	// calls no identity helpers.
 	RecordSocketIdentity bool
-	AssignmentCapacity   uint32
+	// SocketCreatorMap is borrowed from the creator producer. When non-nil,
+	// local TC records socket identity and copies the immutable creator snapshot
+	// into assignments, independently of TrackProcess and RecordSocketIdentity.
+	// The caller keeps it open until Close; TC never closes or creates it.
+	SocketCreatorMap   *CiliumEBPF.Map
+	AssignmentCapacity uint32
 	// ICMPEchoReply loads the independent icmp_echo_reply object (see
 	// tc_icmp_echo_reply.go) and attaches it wherever this TC data plane already
 	// attaches local or shared filters. Left false, prepareTC never touches
@@ -167,11 +172,21 @@ type TCAssignment struct {
 	SocketCgroupID uint64
 	IdentityFlags  uint32
 	Reserved       uint32
+	Creator        SocketCreator
+}
+
+// HasSocketCreator reports a complete creator snapshot for this exact socket.
+func (a TCAssignment) HasSocketCreator() bool {
+	return a.Creator.IsValid() && a.Creator.Cookie == a.SocketCookie
 }
 
 const (
 	TCIdentityUIDValid    uint32 = 1 << 0
 	TCIdentityCgroupValid uint32 = 1 << 1
+	// TCIdentityCreatorChecked marks a valid snapshot or a confirmed missing
+	// entry on a full socket. It is independent of UID/cgroup validity and
+	// does not by itself prove a creator was recorded; use HasSocketCreator.
+	TCIdentityCreatorChecked uint32 = 1 << 2
 )
 
 // HasSocketIdentity reports whether the local egress path recorded the
@@ -187,20 +202,21 @@ type tcRuntime struct {
 }
 
 type TCBackend struct {
-	access           sync.RWMutex
-	health           backendHealth
-	runtime          *tcRuntime
-	tcpListenerMap   bool
-	control          tcControl
-	controlMapFD     int
-	assignmentMapFD  int
-	selfMapExternal  bool
-	bypassIPv4       []netip.Prefix
-	bypassIPv6       []netip.Prefix
-	sharedBypassIPv4 []netip.Prefix
-	sharedBypassIPv6 []netip.Prefix
-	hostIPv4         [][4]byte
-	hostIPv6         [][16]byte
+	access             sync.RWMutex
+	health             backendHealth
+	runtime            *tcRuntime
+	tcpListenerMap     bool
+	control            tcControl
+	controlMapFD       int
+	assignmentMapFD    int
+	selfMapExternal    bool
+	creatorMapExternal bool
+	bypassIPv4         []netip.Prefix
+	bypassIPv6         []netip.Prefix
+	sharedBypassIPv4   []netip.Prefix
+	sharedBypassIPv6   []netip.Prefix
+	hostIPv4           [][4]byte
+	hostIPv6           [][16]byte
 	// uidEntries and uidDefaultBypass are the UID policy the tc_uid_policy map
 	// and the control flags currently hold; UpdateUIDPolicy diffs against them.
 	uidEntries       []uidLPMKey
@@ -231,6 +247,14 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 	}
 	if !config.EnableLocal && !config.EnableShared {
 		return nil, E.New("TC eBPF backend has no enabled data path")
+	}
+	if config.SocketCreatorMap != nil {
+		if !config.EnableLocal {
+			return nil, E.New("socket creator map requires the TC local path")
+		}
+		if err := validateSocketCreatorMap(config.SocketCreatorMap); err != nil {
+			return nil, err
+		}
 	}
 	if config.RoutingMark == 0 {
 		config.RoutingMark = DefaultTCRoutingMark
@@ -343,14 +367,15 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		controlValue.ForceInterceptIPv6Mask = prefixMask16(forceInterceptIPv6.Bits())
 	}
 	backend := &TCBackend{
-		runtime:          &tcRuntime{maps: maps, programs: loadedPrograms},
-		tcpListenerMap:   config.EnableTCP && !legacyTCP,
-		control:          controlValue,
-		controlMapFD:     maps["tc_control"].FD(),
-		assignmentMapFD:  maps["tc_assignment"].FD(),
-		selfMapExternal:  config.EnableLocal && config.SelfBypassMap != nil,
-		uidEntries:       slices.Clone(uidEntries),
-		uidDefaultBypass: policy.uidDefaultBypass,
+		runtime:            &tcRuntime{maps: maps, programs: loadedPrograms},
+		tcpListenerMap:     config.EnableTCP && !legacyTCP,
+		control:            controlValue,
+		controlMapFD:       maps["tc_control"].FD(),
+		assignmentMapFD:    maps["tc_assignment"].FD(),
+		selfMapExternal:    config.EnableLocal && config.SelfBypassMap != nil,
+		creatorMapExternal: config.SocketCreatorMap != nil,
+		uidEntries:         slices.Clone(uidEntries),
+		uidDefaultBypass:   policy.uidDefaultBypass,
 	}
 	// From here, backend owns maps and loadedPrograms: giving up on either of the
 	// steps below has to close it rather than just returning the step's error, or
@@ -391,6 +416,13 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 }
 
 func loadTCResources(config TCConfig, baseOverrides map[string]mapSpecOverride, legacyTCP bool) (map[string]*CiliumEBPF.Map, []*CiliumEBPF.Program, error) {
+	// Validate before the generic loader replaces object layouts with actual map
+	// info. Otherwise a wrong external value ABI could be silently accepted.
+	if config.SocketCreatorMap != nil {
+		if err := validateSocketCreatorMap(config.SocketCreatorMap); err != nil {
+			return nil, nil, err
+		}
+	}
 	mapOverrides := make(map[string]mapSpecOverride, len(baseOverrides))
 	for name, override := range baseOverrides {
 		mapOverrides[name] = override
@@ -408,6 +440,9 @@ func loadTCResources(config TCConfig, baseOverrides map[string]mapSpecOverride, 
 		maps["tc_self_sockets"] = config.SelfBypassMap
 		_ = createdMap.Close()
 	}
+	if config.SocketCreatorMap != nil {
+		maps["socket_creators"] = config.SocketCreatorMap
+	}
 	selections := make([]programSelection, 0, tcProgramCount)
 	programIndexes := make([]int, 0, tcProgramCount)
 	if config.EnableLocal {
@@ -416,6 +451,10 @@ func loadTCResources(config TCConfig, baseOverrides map[string]mapSpecOverride, 
 		if config.TrackProcess || config.RecordSocketIdentity {
 			localEthernetSection = "classifier/local_egress_ethernet_process"
 			localRawIPSection = "classifier/local_egress_raw_ip_process"
+		}
+		if config.SocketCreatorMap != nil {
+			localEthernetSection = "classifier/local_egress_ethernet_creator"
+			localRawIPSection = "classifier/local_egress_raw_ip_creator"
 		}
 		selections = append(selections,
 			programSelection{section: localEthernetSection, kernelProgramName: kernelProgramNameTCLocalEthernet},
@@ -457,6 +496,7 @@ func loadTCResources(config TCConfig, baseOverrides map[string]mapSpecOverride, 
 			// not the rest of the load succeeded.
 			delete(maps, "tc_self_sockets")
 		}
+		delete(maps, "socket_creators")
 		// closeMaps closing something here does not mean the map it held is
 		// actually gone — the same caveat as backend.Close() above — but a
 		// failure out of it is still worth reporting alongside the load failure
@@ -1023,6 +1063,9 @@ func (b *TCBackend) Close() error {
 	if b.selfMapExternal {
 		delete(b.runtime.maps, "tc_self_sockets")
 	}
+	if b.creatorMapExternal {
+		delete(b.runtime.maps, "socket_creators")
+	}
 	closeErr := closeObjectResources(b.runtime.programs, b.runtime.maps)
 	closeErr = E.Errors(closeErr, b.icmpEchoReply.Close())
 	b.icmpEchoReply = nil
@@ -1030,6 +1073,7 @@ func (b *TCBackend) Close() error {
 	b.controlMapFD = -1
 	b.assignmentMapFD = -1
 	b.selfMapExternal = false
+	b.creatorMapExternal = false
 	b.bypassIPv4 = nil
 	b.bypassIPv6 = nil
 	b.sharedBypassIPv4 = nil

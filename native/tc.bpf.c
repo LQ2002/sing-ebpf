@@ -84,6 +84,9 @@
 #define SB_TC_IDENTITY_UID_VALID (1U << 0)
 #define SB_TC_IDENTITY_CGROUP_VALID (1U << 1)
 #define SB_TC_IDENTITY_VALID (SB_TC_IDENTITY_UID_VALID | SB_TC_IDENTITY_CGROUP_VALID)
+// Independent of UID/cgroup validity: a valid creator or a confirmed missing
+// entry from a full socket has been observed. Invalid non-null entries retry.
+#define SB_TC_IDENTITY_CREATOR_CHECKED (1U << 2)
 
 #define SB_TC_STAT_SOCKET_LOOKUP_FAILURE 0U
 #define SB_TC_STAT_SK_ASSIGN_FAILURE 1U
@@ -158,6 +161,34 @@ struct sb_tc_assign_key {
     __u8 destination_addr[16];
 };
 
+// Fixed shared ABI with the socket creator producer. The creator UID is never
+// replaced by the socket's mutable billing UID. No CLONE storage: a child
+// socket must acquire its own creation snapshot rather than inherit one.
+#define SB_SOCKET_CREATOR_VALID (1U << 0)
+struct sb_socket_creator {
+    __u64 cookie;
+    __u64 start_time_ns;
+    __u32 process_id;
+    __u32 thread_id;
+    __u32 user_id;
+    __u32 flags;
+    __u8 comm[16];
+};
+_Static_assert(sizeof(struct sb_socket_creator) == 48, "sb_socket_creator ABI size");
+_Static_assert(__builtin_offsetof(struct sb_socket_creator, cookie) == 0, "creator cookie offset");
+_Static_assert(__builtin_offsetof(struct sb_socket_creator, start_time_ns) == 8, "creator start offset");
+_Static_assert(__builtin_offsetof(struct sb_socket_creator, process_id) == 16, "creator pid offset");
+_Static_assert(__builtin_offsetof(struct sb_socket_creator, thread_id) == 20, "creator tid offset");
+_Static_assert(__builtin_offsetof(struct sb_socket_creator, user_id) == 24, "creator uid offset");
+_Static_assert(__builtin_offsetof(struct sb_socket_creator, flags) == 28, "creator flags offset");
+_Static_assert(__builtin_offsetof(struct sb_socket_creator, comm) == 32, "creator comm offset");
+
+INLINE bool socket_creator_valid(const struct sb_socket_creator *creator, __u64 cookie) {
+    return (creator->flags & SB_SOCKET_CREATOR_VALID) != 0U &&
+        creator->cookie != 0U && creator->cookie == cookie && creator->start_time_ns != 0U &&
+        creator->process_id != 0U && creator->thread_id != 0U;
+}
+
 struct sb_tc_assign_value {
     __u64 socket_cookie;
     __u32 ifindex;
@@ -177,6 +208,7 @@ struct sb_tc_assign_value {
     __u64 socket_cgroup_id;
     __u32 identity_flags;
     __u32 reserved;
+    struct sb_socket_creator creator;
 };
 
 _Static_assert(sizeof(struct sb_tc_control) == 76, "sb_tc_control ABI size");
@@ -211,7 +243,8 @@ union sb_tc_socket_verdict_word {
 _Static_assert(sizeof(union sb_tc_socket_verdict_word) == 8, "sb_tc_socket_verdict_word size");
 
 _Static_assert(sizeof(struct sb_tc_assign_key) == 44, "sb_tc_assign_key ABI size");
-_Static_assert(sizeof(struct sb_tc_assign_value) == 40, "sb_tc_assign_value ABI size");
+_Static_assert(sizeof(struct sb_tc_assign_value) == 88, "sb_tc_assign_value ABI size");
+_Static_assert(__builtin_offsetof(struct sb_tc_assign_value, creator) == 40, "assignment creator offset");
 _Static_assert(__builtin_offsetof(struct sb_tc_assign_value, socket_cookie) == 0,
     "sb_tc_assign_value socket_cookie ABI offset");
 _Static_assert(__builtin_offsetof(struct sb_tc_assign_value, ifindex) == 8,
@@ -295,6 +328,15 @@ MAP(tc_control, __u32, struct sb_tc_control, BPF_MAP_TYPE_ARRAY, 1U);
 MAP(tc_listener_sockets, __u32, __u32, BPF_MAP_TYPE_SOCKMAP, SB_TC_LISTENER_COUNT);
 MAP(tc_assignment, struct sb_tc_assign_key, struct sb_tc_assign_value, BPF_MAP_TYPE_LRU_HASH, 65536U);
 MAP(tc_stats, __u32, __u64, BPF_MAP_TYPE_PERCPU_ARRAY, SB_TC_STAT_COUNT);
+// Borrowed only for the opt-in local creator variants; the default loader does
+// not create or reference this map. The producer owns the sb_sk_creator map.
+struct bpf_map_def SEC("maps") socket_creators = {
+    .type = BPF_MAP_TYPE_SK_STORAGE,
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(struct sb_socket_creator),
+    .max_entries = 0U,
+    .map_flags = 1U, // BPF_F_NO_PREALLOC, explicitly without BPF_F_CLONE.
+};
 // tc_self_sockets 不是普通哈希表，而是挂在 socket 本身上的本地存储。
 // 这样做的理由是回收：按 socket cookie 索引的哈希表没有任何东西在 socket
 // 关闭时删除对应条目（用户态注册路径尤其如此，见 internal/core/self_bypass.go
@@ -846,12 +888,14 @@ INLINE bool build_assignment(struct sb_tc_assign_value *value, const struct sb_t
         value->socket_uid = existing->socket_uid;
         value->socket_cgroup_id = existing->socket_cgroup_id;
         value->identity_flags = existing->identity_flags;
+        value->creator = existing->creator;
     }
     if (existing == 0) return true;
     if (existing->socket_cookie != value->socket_cookie || existing->ifindex != value->ifindex ||
         existing->path != value->path || existing->source_mac_valid != value->source_mac_valid ||
         existing->socket_uid != value->socket_uid || existing->socket_cgroup_id != value->socket_cgroup_id ||
-        existing->identity_flags != value->identity_flags) return true;
+        existing->identity_flags != value->identity_flags ||
+        __builtin_memcmp(&existing->creator, &value->creator, sizeof(value->creator)) != 0) return true;
     return source_mac_valid && !source_mac_equal(existing->source_mac, value->source_mac);
 }
 
@@ -986,6 +1030,53 @@ INLINE void record_local_socket(struct __sk_buff *skb, const struct sb_tc_assign
     map_update(&tc_assignment, key, &value, BPF_ANY);
 }
 
+// Only the opt-in creator variants reach this function. Existing valid
+// snapshots are immutable: the steady path does not read SK_STORAGE again.
+// A missing entry on a full socket is cached for that cookie: the creation
+// hook has already run, so old sockets cannot gain a creation record later.
+// Non-full sockets and invalid non-null entries are retried. fchown refreshes
+// billing UID independently; a new cookie always starts from zero.
+INLINE void record_local_socket_creator(struct __sk_buff *skb, const struct sb_tc_assign_key *key) {
+    __u64 cookie = get_socket_cookie(skb);
+    if (cookie == 0U) return;
+    struct sb_tc_assign_value *existing = map_lookup(&tc_assignment, key);
+    struct sb_tc_assign_value value = {};
+    bool same_socket = existing != 0 && existing->socket_cookie == cookie;
+    bool changed = !same_socket;
+    if (same_socket) value = *existing;
+    else value.socket_cookie = cookie;
+
+    __u32 uid = get_socket_uid(skb);
+    bool read_identity = !same_socket || (value.identity_flags & SB_TC_IDENTITY_VALID) != SB_TC_IDENTITY_VALID ||
+        value.socket_uid != uid;
+    bool read_creator = !socket_creator_valid(&value.creator, cookie) &&
+        (value.identity_flags & SB_TC_IDENTITY_CREATOR_CHECKED) == 0U;
+    __u64 cgroup_id = 0U;
+    if (read_identity || read_creator) {
+        // Only this packet's helper result proves it currently carries a full
+        // socket. A saved cgroup ID cannot prove that for TIME_WAIT packets.
+        cgroup_id = skb_cgroup_id(skb);
+        if (read_identity && cgroup_id != 0U) {
+            value.socket_uid = uid;
+            value.socket_cgroup_id = cgroup_id;
+            value.identity_flags |= SB_TC_IDENTITY_VALID;
+            changed = true;
+        }
+    }
+    if (read_creator && skb->sk != 0) {
+        const struct sb_socket_creator *creator = sk_storage_get(&socket_creators, skb->sk, 0, 0U);
+        if (creator != 0 && socket_creator_valid(creator, cookie)) {
+            value.creator = *creator;
+            value.identity_flags |= SB_TC_IDENTITY_CREATOR_CHECKED;
+            changed = true;
+        } else if (creator == 0 && cgroup_id != 0U) {
+            value.identity_flags |= SB_TC_IDENTITY_CREATOR_CHECKED;
+            changed = true;
+        }
+    }
+    if (changed) map_update(&tc_assignment, key, &value, BPF_ANY);
+}
+
 INLINE int redirect_local(struct __sk_buff *skb, const struct sb_tc_control *control, bool ethernet) {
     if (ethernet) {
         if (skb_store_bytes(skb, 0U, control->delivery_mac, 6U, 0U) != 0) return TC_ACT_UNSPEC;
@@ -999,7 +1090,7 @@ INLINE int redirect_local(struct __sk_buff *skb, const struct sb_tc_control *con
     return redirect((int)control->delivery_ifindex, 0U);
 }
 
-INLINE int local_egress_mark(struct __sk_buff *skb, bool ethernet, bool track_process) {
+INLINE int local_egress_mark(struct __sk_buff *skb, bool ethernet, bool track_process, bool track_creator) {
     const struct sb_tc_control *control = load_control();
     if (control == 0 || control->enabled == 0U || control->delivery_ifindex == 0U) return TC_ACT_UNSPEC;
     if (skb->ingress_ifindex != 0U) return TC_ACT_UNSPEC;
@@ -1011,28 +1102,39 @@ INLINE int local_egress_mark(struct __sk_buff *skb, bool ethernet, bool track_pr
             SB_TC_STAT_LOCAL_FRAGMENT_PASS)) return TC_ACT_UNSPEC;
     if (!local_selected_cached(skb, control, &key, socket_metadata_value)) return TC_ACT_UNSPEC;
     // 只记被选中的流：没被选中的包不会到达 sing-box，没人来查它的条目。
-    if (track_process) record_local_socket(skb, &key);
+    if (track_creator) record_local_socket_creator(skb, &key);
+    else if (track_process) record_local_socket(skb, &key);
     return redirect_local(skb, control, ethernet);
 }
 
 SEC("classifier/local_egress_ethernet_mark")
 int sing_ebpf_tc_local_egress_ethernet_mark(struct __sk_buff *skb) {
-	return local_egress_mark(skb, true, false);
+	return local_egress_mark(skb, true, false, false);
 }
 
 SEC("classifier/local_egress_raw_ip_mark")
 int sing_ebpf_tc_local_egress_raw_ip_mark(struct __sk_buff *skb) {
-	return local_egress_mark(skb, false, false);
+	return local_egress_mark(skb, false, false, false);
 }
 
 SEC("classifier/local_egress_ethernet_process")
 int sing_ebpf_tc_local_egress_ethernet_process(struct __sk_buff *skb) {
-	return local_egress_mark(skb, true, true);
+	return local_egress_mark(skb, true, true, false);
 }
 
 SEC("classifier/local_egress_raw_ip_process")
 int sing_ebpf_tc_local_egress_raw_ip_process(struct __sk_buff *skb) {
-	return local_egress_mark(skb, false, true);
+	return local_egress_mark(skb, false, true, false);
+}
+
+SEC("classifier/local_egress_ethernet_creator")
+int sing_ebpf_tc_local_egress_ethernet_creator(struct __sk_buff *skb) {
+    return local_egress_mark(skb, true, true, true);
+}
+
+SEC("classifier/local_egress_raw_ip_creator")
+int sing_ebpf_tc_local_egress_raw_ip_creator(struct __sk_buff *skb) {
+    return local_egress_mark(skb, false, true, true);
 }
 
 INLINE int shared_ingress(struct __sk_buff *skb, bool ethernet) {
