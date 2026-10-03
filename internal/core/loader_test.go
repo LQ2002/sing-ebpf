@@ -311,7 +311,7 @@ func TestEmbeddedTCObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadTC, map[string]objectMapLayout{
 		"tc_control":          {4, 76},
 		"tc_listener_sockets": {4, 4},
-		"tc_assignment":       {44, 24},
+		"tc_assignment":       {44, 40},
 		"tc_stats":            {4, 8},
 		// Socket local storage carries no key of its own: the socket is the
 		// key, so the kernel reports a key size of zero.
