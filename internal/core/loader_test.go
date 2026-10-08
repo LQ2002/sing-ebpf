@@ -341,12 +341,13 @@ func TestCgroupReleaseNotificationUsesRingBufferHelper(t *testing.T) {
 
 func TestEmbeddedTCObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadTC, map[string]objectMapLayout{
-		"tc_control":          {4, 76},
-		"tc_listener_sockets": {4, 4},
-		"tc_assignment":       {44, 112},
-		"socket_creators":     {4, 64},
-		"netd_cookie_tags":    {8, 8},
-		"tc_stats":            {4, 8},
+		"tc_control":           {4, 76},
+		"tc_listener_sockets":  {4, 4},
+		"tc_assignment":        {44, 112},
+		"socket_creators":      {4, 64},
+		"netd_cookie_tags":     {8, 8},
+		"tc_stats":             {4, 8},
+		"tc_assign_generation": {4, 8},
 		// Socket local storage carries no key of its own: the socket is the
 		// key, so the kernel reports a key size of zero.
 		"tc_self_sockets":        {0, 4},

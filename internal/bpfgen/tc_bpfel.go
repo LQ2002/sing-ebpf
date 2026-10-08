@@ -18,6 +18,7 @@ import (
 const (
 	TCMapNetdCookieTags                         = "netd_cookie_tags"
 	TCMapSocketCreators                         = "socket_creators"
+	TCMapTcAssignGeneration                     = "tc_assign_generation"
 	TCMapTcAssignment                           = "tc_assignment"
 	TCMapTcControl                              = "tc_control"
 	TCMapTcExcludeSourceIpv4                    = "tc_exclude_source_ipv4"
@@ -121,6 +122,7 @@ type TCProgramSpecs struct {
 type TCMapSpecs struct {
 	NetdCookieTags      *ebpf.MapSpec `ebpf:"netd_cookie_tags"`
 	SocketCreators      *ebpf.MapSpec `ebpf:"socket_creators"`
+	TcAssignGeneration  *ebpf.MapSpec `ebpf:"tc_assign_generation"`
 	TcAssignment        *ebpf.MapSpec `ebpf:"tc_assignment"`
 	TcControl           *ebpf.MapSpec `ebpf:"tc_control"`
 	TcExcludeSourceIpv4 *ebpf.MapSpec `ebpf:"tc_exclude_source_ipv4"`
@@ -172,6 +174,7 @@ func (o *TCObjects) Close() error {
 type TCMaps struct {
 	NetdCookieTags      *ebpf.Map `ebpf:"netd_cookie_tags"`
 	SocketCreators      *ebpf.Map `ebpf:"socket_creators"`
+	TcAssignGeneration  *ebpf.Map `ebpf:"tc_assign_generation"`
 	TcAssignment        *ebpf.Map `ebpf:"tc_assignment"`
 	TcControl           *ebpf.Map `ebpf:"tc_control"`
 	TcExcludeSourceIpv4 *ebpf.Map `ebpf:"tc_exclude_source_ipv4"`
@@ -199,6 +202,7 @@ func (m *TCMaps) Close() error {
 	return _TCClose(
 		m.NetdCookieTags,
 		m.SocketCreators,
+		m.TcAssignGeneration,
 		m.TcAssignment,
 		m.TcControl,
 		m.TcExcludeSourceIpv4,

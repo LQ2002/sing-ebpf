@@ -226,13 +226,16 @@ type tcRuntime struct {
 }
 
 type TCBackend struct {
-	access             sync.RWMutex
-	health             backendHealth
-	runtime            *tcRuntime
-	tcpListenerMap     bool
-	control            tcControl
-	controlMapFD       int
-	assignmentMapFD    int
+	access          sync.RWMutex
+	health          backendHealth
+	runtime         *tcRuntime
+	tcpListenerMap  bool
+	control         tcControl
+	controlMapFD    int
+	assignmentMapFD int
+	// assignGeneration is the read-only mapping of tc_assign_generation, or
+	// nil when the kernel could not map it (tc_assign_generation.go).
+	assignGeneration   []byte
 	selfMapExternal    bool
 	creatorMapExternal bool
 	cookieTagExternal  bool
@@ -311,11 +314,13 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		return nil, err
 	}
 	_ = raiseMemlockLimit()
+	generationMmapable := assignGenerationMmapable()
 	mapOverrides := map[string]mapSpecOverride{
-		"tc_control":          {name: "sb_tc_ctl", mapType: CiliumEBPF.Array, maxEntries: 1},
-		"tc_listener_sockets": {name: "sb_tc_listen", mapType: CiliumEBPF.SockMap, maxEntries: 2},
-		"tc_assignment":       {name: "sb_tc_assign", mapType: CiliumEBPF.LRUHash, maxEntries: config.AssignmentCapacity},
-		"tc_stats":            {name: "sb_tc_stats", mapType: CiliumEBPF.PerCPUArray, maxEntries: tcStatCount},
+		"tc_control":           {name: "sb_tc_ctl", mapType: CiliumEBPF.Array, maxEntries: 1},
+		"tc_listener_sockets":  {name: "sb_tc_listen", mapType: CiliumEBPF.SockMap, maxEntries: 2},
+		"tc_assignment":        {name: "sb_tc_assign", mapType: CiliumEBPF.LRUHash, maxEntries: config.AssignmentCapacity},
+		"tc_stats":             {name: "sb_tc_stats", mapType: CiliumEBPF.PerCPUArray, maxEntries: tcStatCount},
+		"tc_assign_generation": assignGenerationOverride(generationMmapable),
 		// Sized to the compile limit rather than to the startup policy, so that
 		// UpdateUIDPolicy can grow it later. NO_PREALLOC: an LPM trie allocates
 		// each node on insert, so unused capacity costs no memory.
@@ -405,6 +410,7 @@ func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 		control:            controlValue,
 		controlMapFD:       maps["tc_control"].FD(),
 		assignmentMapFD:    maps["tc_assignment"].FD(),
+		assignGeneration:   mapAssignGeneration(maps["tc_assign_generation"], generationMmapable),
 		selfMapExternal:    config.EnableLocal && config.SelfBypassMap != nil,
 		creatorMapExternal: config.SocketCreatorMap != nil,
 		cookieTagExternal:  config.SocketCreatorMap != nil && config.CookieTagMap != nil,
@@ -1162,6 +1168,8 @@ func (b *TCBackend) Close() error {
 	if b.cookieTagExternal {
 		delete(b.runtime.maps, "netd_cookie_tags")
 	}
+	unmapAssignGeneration(b.assignGeneration)
+	b.assignGeneration = nil
 	closeErr := closeObjectResources(b.runtime.programs, b.runtime.maps)
 	closeErr = E.Errors(closeErr, b.icmpEchoReply.Close())
 	b.icmpEchoReply = nil
