@@ -317,6 +317,14 @@ func (b *TCBackend) Stats() (TCStats, error) {
 	return core.UnwrapTCBackend(b).Stats()
 }
 
+// AssignmentGeneration returns the count of TC assignment writes so far,
+// read without a system call, or false when the kernel cannot provide it.
+// An assignment looked up after reading generation g stays valid while the
+// generation is still g; see core.(*TCBackend).AssignmentGeneration.
+func (b *TCBackend) AssignmentGeneration() (uint64, bool) {
+	return core.UnwrapTCBackend(b).AssignmentGeneration()
+}
+
 func (b *TCBackend) SetDeliveryInterface(interfaceIndex uint32, hardwareAddress MACAddress) error {
 	return core.UnwrapTCBackend(b).SetDeliveryInterface(interfaceIndex, hardwareAddress)
 }

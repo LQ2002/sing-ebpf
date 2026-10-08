@@ -12,6 +12,11 @@ static bool saved_present, storage_present, charge_present;
 static __u64 fake_cookie, fake_cgroup;
 static __u32 fake_uid;
 static int storage_reads, charge_reads, updates;
+// tc_assign_generation's element. Every tc_assignment write must be followed
+// by exactly one bump before the next write (checked in update) and before
+// the scenario ends (checked in check_generation).
+static __u64 generation;
+static void check_generation(void) { assert(generation == (__u64)updates); }
 
 static void *lookup(void *map, const void *key) {
     if (map == &netd_cookie_tags) {
@@ -20,11 +25,16 @@ static void *lookup(void *map, const void *key) {
         ++charge_reads;
         return charge_present ? &charge : NULL;
     }
+    if (map == &tc_assign_generation) {
+        assert(*(const __u32 *)key == 0U);
+        return &generation;
+    }
     assert(map == &tc_assignment);
     return saved_present ? &saved : NULL;
 }
 static long update(void *map, const void *key, const void *value, __u64 flags) {
     assert(map == &tc_assignment && flags == BPF_ANY);
+    check_generation();
     saved = *(const struct sb_tc_assign_value *)value;
     saved_present = true;
     ++updates;
@@ -39,6 +49,8 @@ static __u64 cookie(void *ctx) { return fake_cookie; }
 static __u64 cgroup(void *ctx) { return fake_cgroup; }
 static __u32 uid(void *ctx) { return fake_uid; }
 static void reset(void) {
+    check_generation();
+    generation = 0;
     memset(&saved, 0, sizeof(saved));
     saved_present = false;
     storage_present = true;
@@ -255,6 +267,7 @@ int main(void) {
     charge_present = true;
     record_local_socket(&skb, &key);
     assert(saved.socket_uid == fake_uid && storage_reads == 0 && charge_reads == 0);
+    check_generation();
     puts("creator state transitions passed (host C helpers; no kernel data plane)");
     return 0;
 }

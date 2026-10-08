@@ -365,6 +365,14 @@ MAP(tc_control, __u32, struct sb_tc_control, BPF_MAP_TYPE_ARRAY, 1U);
 MAP(tc_listener_sockets, __u32, __u32, BPF_MAP_TYPE_SOCKMAP, SB_TC_LISTENER_COUNT);
 MAP(tc_assignment, struct sb_tc_assign_key, struct sb_tc_assign_value, BPF_MAP_TYPE_LRU_HASH, 65536U);
 MAP(tc_stats, __u32, __u64, BPF_MAP_TYPE_PERCPU_ARRAY, SB_TC_STAT_COUNT);
+// tc_assign_generation 是 tc_assignment 的写入代号：本文件每写一次 tc_assignment
+// 就在写完之后加一（bump_assignment_generation）。用户态把这个单元素数组以
+// BPF_F_MMAPABLE 映射进内存，不经系统调用就能读到当前代号，据此判断自己缓存的
+// 分配结果是否可能已过期：代号没变，就说明从它读取代号之后没有任何分配被写过。
+//
+// 写入与加一都发生在引起它的那个包被 sk_assign 送进监听 socket 之前，所以用户态
+// 读到这个包时一定也能看到这次加一。代号只增不减，跨 CPU 用原子加。
+MAP(tc_assign_generation, __u32, __u64, BPF_MAP_TYPE_ARRAY, 1U);
 // Borrowed only for the opt-in local creator variants; the default loader does
 // not create or reference this map. The producer owns the sb_sk_creator map.
 struct bpf_map_def SEC("maps") socket_creators = {
@@ -456,6 +464,12 @@ INLINE void increment_stat(__u32 index) {
     if (index >= SB_TC_STAT_COUNT) return;
     __u64 *value = map_lookup(&tc_stats, &index);
     if (value != 0) *value += 1U;
+}
+
+INLINE void bump_assignment_generation(void) {
+    __u32 index = 0U;
+    __u64 *generation = map_lookup(&tc_assign_generation, &index);
+    if (generation != 0) __sync_fetch_and_add(generation, 1U);
 }
 
 INLINE __u16 network_order16(__u16 value) {
@@ -994,9 +1008,12 @@ NOINLINE int assign_socket(struct __sk_buff *skb, const struct sb_tc_control *co
         increment_stat(SB_TC_STAT_SK_ASSIGN_FAILURE);
         return TC_ACT_SHOT;
     }
-    if (assignment_changed && map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
-        increment_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILURE);
-        return TC_ACT_SHOT;
+    if (assignment_changed) {
+        if (map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
+            increment_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILURE);
+            return TC_ACT_SHOT;
+        }
+        bump_assignment_generation();
     }
     return TC_ACT_OK;
 }
@@ -1024,9 +1041,12 @@ NOINLINE int assign_socket_legacy(struct __sk_buff *skb, const struct sb_tc_cont
         increment_stat(SB_TC_STAT_SK_ASSIGN_FAILURE);
         return TC_ACT_SHOT;
     }
-    if (assignment_changed && map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
-        increment_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILURE);
-        return TC_ACT_SHOT;
+    if (assignment_changed) {
+        if (map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
+            increment_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILURE);
+            return TC_ACT_SHOT;
+        }
+        bump_assignment_generation();
     }
     return TC_ACT_OK;
 }
@@ -1051,9 +1071,12 @@ NOINLINE int assign_udp_socket(struct __sk_buff *skb, const struct sb_tc_control
         increment_stat(SB_TC_STAT_SK_ASSIGN_FAILURE);
         return TC_ACT_SHOT;
     }
-    if (assignment_changed && map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
-        increment_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILURE);
-        return TC_ACT_SHOT;
+    if (assignment_changed) {
+        if (map_update(&tc_assignment, &assignment_key, &value, BPF_ANY) != 0) {
+            increment_stat(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILURE);
+            return TC_ACT_SHOT;
+        }
+        bump_assignment_generation();
     }
     return TC_ACT_OK;
 }
@@ -1100,6 +1123,7 @@ INLINE void record_local_socket(struct __sk_buff *skb, const struct sb_tc_assign
         }
     }
     map_update(&tc_assignment, key, &value, BPF_ANY);
+    bump_assignment_generation();
 }
 
 // Only the opt-in creator variants reach this function. Existing valid
@@ -1163,7 +1187,10 @@ INLINE void record_local_socket_creator(struct __sk_buff *skb, const struct sb_t
         }
         changed = true;
     }
-    if (changed) map_update(&tc_assignment, key, &value, BPF_ANY);
+    if (changed) {
+        map_update(&tc_assignment, key, &value, BPF_ANY);
+        bump_assignment_generation();
+    }
 }
 
 INLINE int redirect_local(struct __sk_buff *skb, const struct sb_tc_control *control, bool ethernet) {
