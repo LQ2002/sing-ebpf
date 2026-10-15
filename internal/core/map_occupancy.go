@@ -90,7 +90,7 @@ func InspectMapOccupancy() MapOccupancyReport {
 func mapOccupancyStatus(maps []MapOccupancy) string {
 	status := "pass"
 	for _, item := range maps {
-		if item.Pressure == "degraded" {
+		if item.Pressure == "degraded" || item.Pressure == "recovery_failed" {
 			return "degraded"
 		} else if item.Pressure == "warning" {
 			status = "warning"

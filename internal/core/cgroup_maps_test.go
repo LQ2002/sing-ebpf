@@ -92,6 +92,13 @@ func TestMapOccupancyStatusIgnoresNonApplicableMaps(t *testing.T) {
 	if status != "warning" {
 		t.Fatalf("map occupancy status = %q, want warning", status)
 	}
+	status = mapOccupancyStatus([]MapOccupancy{
+		{Pressure: "not_applicable", Supported: false},
+		{Pressure: "recovery_failed", Supported: true, Error: "map key iteration aborted"},
+	})
+	if status != "degraded" {
+		t.Fatalf("map occupancy status = %q, want degraded after recovery failure", status)
+	}
 }
 
 func TestUDPReleasePathDiagnosticsReportsFallback(t *testing.T) {
