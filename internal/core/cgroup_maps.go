@@ -59,10 +59,11 @@ func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, 
 			name: "sb_cg_sock_byp", mapType: CiliumEBPF.SkStorage, flags: bpfFlagNoPrealloc,
 		}
 	}
-	if runtimeState.socket_release_supported && features.HaveMapType(CiliumEBPF.RingBuf) != nil {
+	ringbufSupported := features.HaveMapType(CiliumEBPF.RingBuf) == nil
+	if runtimeState.socket_release_supported && !ringbufSupported {
 		runtimeState.udp_release_fallback_reason = "ringbuf_unsupported"
 	}
-	if runtimeState.socket_release_supported && features.HaveMapType(CiliumEBPF.RingBuf) == nil {
+	if runtimeState.socket_release_supported && ringbufSupported {
 		overrides["cgroup_udp_release_watch"] = mapSpecOverride{
 			name: "sb_cg_rel_watch", mapType: CiliumEBPF.Hash, maxEntries: udpCapacity, flags: bpfFlagNoPrealloc,
 		}
