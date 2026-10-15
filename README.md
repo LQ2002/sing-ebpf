@@ -70,6 +70,11 @@ value-level flow and policy operations, and diagnostics. A non-nil
 `ProcessTracker` returned with an attach error owns incomplete rollback state
 and must be retained until `Close` succeeds.
 
+On-demand map occupancy diagnostics include library-owned `MapCategory` metadata.
+`runtime` maps describe live state and `configured_policy` maps describe
+capacity derived from the compiled policy; consumers should use this category
+instead of maintaining a map-name classification list.
+
 ## Packet paths
 
 The library has four concrete backend choices: local `tc` or `cgroup`, and

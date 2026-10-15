@@ -49,7 +49,7 @@ func TestInspectMapOccupancyCountsKeys(t *testing.T) {
 				if item.ID != id {
 					continue
 				}
-				if !item.Supported || item.Error != "" || item.Entries != entries {
+				if !item.Supported || item.Error != "" || item.Entries != entries || item.Category != MapCategoryRuntime {
 					t.Fatalf("occupancy = %+v, want %d entries without error", item, entries)
 				}
 				return
