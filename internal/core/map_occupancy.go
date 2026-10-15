@@ -76,7 +76,7 @@ func InspectMapOccupancy() MapOccupancyReport {
 		if err != nil {
 			item.Error = err.Error()
 		}
-		item.Pressure = mapPressure(item.Entries, item.MaxEntries, item.Error != "")
+		item.Pressure = mapPressure(item.Name, item.Entries, item.MaxEntries, item.Error != "")
 		report.Maps = append(report.Maps, item)
 		_ = m.Close()
 	}
@@ -99,9 +99,12 @@ func mapOccupancyStatus(maps []MapOccupancy) string {
 	return status
 }
 
-func mapPressure(entries, maxEntries uint32, failed bool) string {
+func mapPressure(name string, entries, maxEntries uint32, failed bool) string {
 	if failed {
 		return "recovery_failed"
+	}
+	if configuredPolicyMap(name) {
+		return "configured"
 	}
 	if maxEntries == 0 {
 		return "unknown"
@@ -114,6 +117,29 @@ func mapPressure(entries, maxEntries uint32, failed bool) string {
 		return "warning"
 	default:
 		return "healthy"
+	}
+}
+
+// configuredPolicyMap identifies maps whose capacity is derived from the
+// current policy rather than used as a runtime state bound. Filling one of
+// these maps is expected after the policy has been compiled; it must not be
+// reported as runtime pressure. Maps with a fixed policy ceiling remain
+// pressure-visible so an actual policy-capacity limit is still diagnosable.
+func configuredPolicyMap(name string) bool {
+	switch name {
+	case
+		"sb_cg_bypass_port",
+		"sb_cg_uid",
+		"sb_proc_uid",
+		"sb_tc_uid",
+		"sb_tc_insrc4", "sb_tc_insrc6",
+		"sb_tc_exsrc4", "sb_tc_exsrc6",
+		"sb_tc_insmac", "sb_tc_exsmac",
+		"sb_tc_lport", "sb_tc_sport",
+		"sb_sh_inmac", "sb_sh_exmac", "sb_sh_port":
+		return true
+	default:
+		return false
 	}
 }
 

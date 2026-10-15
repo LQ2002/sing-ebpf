@@ -442,7 +442,7 @@ func (b *SharedPacketRewriteBackend) SweepOrphanedFlows(
 	fallbackBudget uint32,
 ) (SharedPacketRewriteSweepResult, error) {
 	if b == nil {
-		return SharedPacketRewriteSweepResult{}, errBackendClosed
+		return SharedPacketRewriteSweepResult{Failure: SharedPacketRewriteSweepFailureClosed}, errBackendClosed
 	}
 	if maxIdle <= 0 || fallbackBudget == 0 {
 		return SharedPacketRewriteSweepResult{}, unix.EINVAL
@@ -458,8 +458,9 @@ func (b *SharedPacketRewriteBackend) SweepOrphanedFlows(
 	maxIdleNS := uint64(maxIdle)
 	if nowNS <= maxIdleNS {
 		return SharedPacketRewriteSweepResult{
-			Usage:    MapUsage{Capacity: b.mapCapacity.Proxy},
-			Complete: true,
+			Usage:      MapUsage{Capacity: b.mapCapacity.Proxy},
+			Complete:   true,
+			UsageKnown: true,
 		}, nil
 	}
 	staleBefore := nowNS - maxIdleNS
@@ -467,7 +468,7 @@ func (b *SharedPacketRewriteBackend) SweepOrphanedFlows(
 	b.access.RLock()
 	defer b.access.RUnlock()
 	if b.runtime == nil {
-		return SharedPacketRewriteSweepResult{}, errBackendClosed
+		return SharedPacketRewriteSweepResult{Failure: SharedPacketRewriteSweepFailureClosed}, errBackendClosed
 	}
 	mapFD := int(b.runtime.flow_by_original_map_fd)
 	b.flowSweepCandidates = b.flowSweepCandidates[:0]
@@ -485,12 +486,13 @@ func (b *SharedPacketRewriteBackend) SweepOrphanedFlows(
 		},
 	)
 	if err != nil {
-		return SharedPacketRewriteSweepResult{}, err
+		return SharedPacketRewriteSweepResult{Failure: SharedPacketRewriteSweepFailureScan}, err
 	}
 	result := SharedPacketRewriteSweepResult{
-		Scanned:  scan.Scanned,
-		Usage:    MapUsage{Capacity: b.mapCapacity.Proxy},
-		Complete: scan.Complete,
+		Scanned:    scan.Scanned,
+		Usage:      MapUsage{Capacity: b.mapCapacity.Proxy},
+		Complete:   scan.Complete,
+		UsageKnown: scan.Complete,
 	}
 	var sweepErr error
 	for _, entry := range b.flowSweepCandidates {
@@ -499,6 +501,10 @@ func (b *SharedPacketRewriteBackend) SweepOrphanedFlows(
 			result.Retained++
 		}
 		if removeErr != nil {
+			if errors.Is(removeErr, unix.ENOENT) {
+				continue
+			}
+			result.Failure = SharedPacketRewriteSweepFailureDelete
 			sweepErr = E.Errors(sweepErr, removeErr)
 			continue
 		}
@@ -515,6 +521,7 @@ func (b *SharedPacketRewriteBackend) SweepOrphanedFlows(
 			result.Usage.Entries -= b.flowSweepRemoved
 		}
 		b.flowSweepRemoved = 0
+		result.UsageKnown = true
 	}
 	return result, sweepErr
 }

@@ -34,7 +34,12 @@ jobs:
         run: |
           "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version
           make check
+          git diff --exit-code -- internal/bpfgen
           go clean -cache
+
+      - name: Verify Go ABI contracts
+        run: |
+          go test -tags with_ebpf ./internal/core -run 'TestTCABI|TestSweepAssignments|Test.*Layout'
 
       - name: Test and vet
         run: |

@@ -66,6 +66,22 @@ Changes to public APIs also require a consumer build with and without
 not install hooks, change dial behavior, create goroutines, or touch kernel
 network state.
 
+## Platform compatibility matrix
+
+Keep platform claims capability-based and test them separately:
+
+| Environment | Required evidence | Common compatibility risks |
+| --- | --- | --- |
+| Standard Linux | cgroup2 when selected, optional bpffs pins, BPF syscall, TC classifier and selected helper/program loads; privileged namespace tests | distro kernel config, LSM, missing veth/TC modules, route or sysctl policy |
+| OpenWrt | exact target-kernel modules, writable cgroup2 when selected, optional bpffs pins, TC/veth checks where selected, and a real router/interface test | module names/configs vary by target; low RAM and concurrent-flow map pressure |
+| Root Android | root-service capability probe, vendor BPF/TC objects, netd coexistence, SELinux audit, interface transition and cleanup test | cgroup single-program owners, vendor backports, bpffs namespace, raw-IP/rmnet framing, hotspot/default-interface changes |
+
+Do not publish a minimum kernel version as a substitute for these checks. Record
+the exact kernel release, config or module list, architecture, LSM/SELinux
+policy, link framing, selected fallback, and map capacities in real-device
+results. A successful object preflight is not evidence that a service can attach
+to a cgroup/interface or change routes and sysctls.
+
 ## BPF C and generated objects
 
 Generation is intentionally reproducible and pinned to Android NDK r29 Clang

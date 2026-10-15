@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	processSocketOwnerCapacity        = 65536
+	processSocketOwnerCapacity        = 16384
 	compactProcessSocketOwnerCapacity = 8192
 )
 

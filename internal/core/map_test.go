@@ -26,7 +26,7 @@ func TestCompactMapCapacities(t *testing.T) {
 	if got := processSocketOwnerMapCapacity("android"); got != 8192 {
 		t.Fatalf("Android process-owner capacity = %d, want 8192", got)
 	}
-	if got := processSocketOwnerMapCapacity("linux"); got != processSocketOwnerCapacity {
+	if got := processSocketOwnerMapCapacity("linux"); got != 16384 {
 		t.Fatalf("Linux process-owner capacity = %d, want %d", got, processSocketOwnerCapacity)
 	}
 	if got := CompactCgroupMapCapacity().SocketBypass; got != 8192 {
@@ -38,7 +38,10 @@ func TestCompactMapCapacities(t *testing.T) {
 	if got := CompactSharedPacketRewriteMapCapacity().Bypass; got != 8192 {
 		t.Fatalf("compact shared bypass capacity = %d, want 8192", got)
 	}
-	if CompactSelfBypassSocketCapacity != 16384 || CompactTCAssignmentCapacity != 16384 {
-		t.Fatal("compact self-bypass and TC assignment capacities must be 16384")
+	if CompactSelfBypassSocketCapacity != 8192 || CompactTCAssignmentCapacity != 8192 {
+		t.Fatal("compact self-bypass and TC assignment capacities must be 8192")
+	}
+	if selfBypassSocketCapacity != 16384 || tcAssignmentCapacity != 32768 {
+		t.Fatal("Linux runtime map capacities must be 16384/32768")
 	}
 }

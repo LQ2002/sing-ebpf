@@ -55,15 +55,30 @@ func TestMapPressureLevels(t *testing.T) {
 		{95, 100, false, "degraded"},
 		{0, 100, true, "recovery_failed"},
 	} {
-		if got := mapPressure(testCase.entries, testCase.capacity, testCase.failed); got != testCase.want {
+		if got := mapPressure("sb_tc_assign", testCase.entries, testCase.capacity, testCase.failed); got != testCase.want {
 			t.Fatalf("mapPressure(%d/%d, %v)=%q, want %q", testCase.entries, testCase.capacity, testCase.failed, got, testCase.want)
 		}
+	}
+}
+
+func TestConfiguredPolicyMapPressureIsNeutral(t *testing.T) {
+	for _, name := range []string{"sb_tc_insmac", "sb_tc_sport", "sb_cg_uid", "sb_sh_port"} {
+		if got := mapPressure(name, 10, 10, false); got != "configured" {
+			t.Fatalf("mapPressure(%q)=%q, want configured", name, got)
+		}
+	}
+	if got := mapPressure("sb_tc_insmac", 0, 10, true); got != "recovery_failed" {
+		t.Fatalf("failed configured map pressure = %q, want recovery_failed", got)
+	}
+	if got := mapPressure("sb_tc_lbypass4", 95, 100, false); got != "degraded" {
+		t.Fatalf("fixed-capacity policy map pressure = %q, want degraded", got)
 	}
 }
 
 func TestMapOccupancyStatusIgnoresNonApplicableMaps(t *testing.T) {
 	status := mapOccupancyStatus([]MapOccupancy{
 		{Pressure: "not_applicable", Supported: false},
+		{Pressure: "configured", Supported: true},
 		{Pressure: "healthy", Supported: true},
 	})
 	if status != "pass" {
@@ -71,6 +86,7 @@ func TestMapOccupancyStatusIgnoresNonApplicableMaps(t *testing.T) {
 	}
 	status = mapOccupancyStatus([]MapOccupancy{
 		{Pressure: "not_applicable", Supported: false},
+		{Pressure: "configured", Supported: true},
 		{Pressure: "warning", Supported: true},
 	})
 	if status != "warning" {

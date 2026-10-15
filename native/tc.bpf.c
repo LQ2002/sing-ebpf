@@ -118,6 +118,16 @@ struct sb_tc_control {
     // updateControlLocked），所以缓存下来的判定只要代号对不上就作废。0 保留为
     // "没有缓存"，永远不会被用作一个有效代号。
     __u32 policy_generation;
+    // activity_epoch is the current TC assignment activity period. Userspace
+    // advances it from SweepAssignments (at most once per second) and records
+    // when each period began; assign_* stamp it into the entries they pass.
+    // An entry still stamped with period e saw no packet after period e + 1
+    // began, which is how the sweep proves idleness without a per-packet
+    // clock read: upstream stamps ktime_get_ns() into every assignment on
+    // every packet, which costs a helper call and a store into a shared
+    // entry per packet. Here an entry is written at most once per period.
+    // Advancing it never bumps policy_generation, so cached verdicts survive.
+    __u32 activity_epoch;
 };
 
 struct sb_tc_uid_key {
@@ -232,7 +242,10 @@ struct sb_tc_assign_value {
     __u32 socket_uid;
     __u64 socket_cgroup_id;
     __u32 identity_flags;
-    __u32 reserved;
+    // activity_epoch: see sb_tc_control.activity_epoch. 0 means not yet
+    // stamped (an entry only the local path has written); the sweep never
+    // removes those. It is not part of the "changed" comparison.
+    __u32 activity_epoch;
     struct sb_socket_creator creator;
     // netd's cookie_tag_map entry for this socket, read once together with the
     // creator (SB_TC_IDENTITY_CHARGE_*). charge_uid is the UID netd bills the
@@ -246,7 +259,9 @@ struct sb_tc_assign_value {
     __u32 charge_tag;
 };
 
-_Static_assert(sizeof(struct sb_tc_control) == 76, "sb_tc_control ABI size");
+_Static_assert(sizeof(struct sb_tc_control) == 80, "sb_tc_control ABI size");
+_Static_assert(__builtin_offsetof(struct sb_tc_control, activity_epoch) == 76,
+    "sb_tc_control activity_epoch ABI offset");
 _Static_assert(__builtin_offsetof(struct sb_tc_control, delivery_ifindex) == 8,
     "sb_tc_control delivery_ifindex ABI offset");
 _Static_assert(__builtin_offsetof(struct sb_tc_control, routing_mark) == 12,
@@ -298,6 +313,8 @@ _Static_assert(__builtin_offsetof(struct sb_tc_assign_value, socket_cgroup_id) =
     "sb_tc_assign_value socket_cgroup_id ABI offset");
 _Static_assert(__builtin_offsetof(struct sb_tc_assign_value, identity_flags) == 32,
     "sb_tc_assign_value identity_flags ABI offset");
+_Static_assert(__builtin_offsetof(struct sb_tc_assign_value, activity_epoch) == 36,
+    "sb_tc_assign_value activity_epoch ABI offset");
 
 struct ethernet_header {
     __u8 destination[6];
@@ -960,8 +977,9 @@ INLINE bool socket_creator_equal(const struct sb_socket_creator *left, const str
 // 写就会把它们抹掉。shared 路径的包来自别的主机，没有本机 socket：cookie 与身份都是 0，
 // 若同键下残留着本机条目，就把它改写成 0，而不是继续挂着一个不属于这条流的身份。
 INLINE bool build_assignment(struct sb_tc_assign_value *value, const struct sb_tc_assign_value *existing,
-    __u32 ifindex, const __u8 source_mac[6], __u8 path, bool source_mac_valid) {
+    __u32 ifindex, const __u8 source_mac[6], __u8 path, bool source_mac_valid, __u32 epoch) {
     __builtin_memset(value, 0, sizeof(*value));
+    value->activity_epoch = epoch;
     value->ifindex = ifindex;
     value->path = path;
     value->source_mac_valid = source_mac_valid;
@@ -985,6 +1003,15 @@ INLINE bool build_assignment(struct sb_tc_assign_value *value, const struct sb_t
     return source_mac_valid && !source_mac_equal(existing->source_mac, value->source_mac);
 }
 
+// touch_assignment stamps the current activity period into an unchanged
+// entry. The store happens once per entry per period; every other packet only
+// reads the field. A racing writer on another CPU can at worst leave an older
+// period, which makes the entry look idle sooner; the sweep rechecks the
+// whole value before deleting and the next packet recreates a deleted entry.
+INLINE void touch_assignment(struct sb_tc_assign_value *existing, __u32 epoch) {
+    if (existing->activity_epoch != epoch) existing->activity_epoch = epoch;
+}
+
 NOINLINE int assign_socket(struct __sk_buff *skb, const struct sb_tc_control *control,
     const struct sb_tc_assign_key *key, const __u8 source_mac[6], __u8 path) {
     bool source_mac_valid = (path & SB_TC_PATH_SOURCE_MAC_VALID) != 0U;
@@ -1001,7 +1028,8 @@ NOINLINE int assign_socket(struct __sk_buff *skb, const struct sb_tc_control *co
         assignment_key.interface_index = skb->ifindex;
     struct sb_tc_assign_value *existing = map_lookup(&tc_assignment, &assignment_key);
     struct sb_tc_assign_value value;
-    bool assignment_changed = build_assignment(&value, existing, skb->ifindex, source_mac, path, source_mac_valid);
+    __u32 epoch = *(volatile const __u32 *)&control->activity_epoch;
+    bool assignment_changed = build_assignment(&value, existing, skb->ifindex, source_mac, path, source_mac_valid, epoch);
     long result = sk_assign(skb, socket, 0U);
     sk_release(socket);
     if (result != 0) {
@@ -1014,6 +1042,8 @@ NOINLINE int assign_socket(struct __sk_buff *skb, const struct sb_tc_control *co
             return TC_ACT_SHOT;
         }
         bump_assignment_generation();
+    } else {
+        touch_assignment(existing, epoch);
     }
     return TC_ACT_OK;
 }
@@ -1034,7 +1064,8 @@ NOINLINE int assign_socket_legacy(struct __sk_buff *skb, const struct sb_tc_cont
         assignment_key.interface_index = skb->ifindex;
     struct sb_tc_assign_value *existing = map_lookup(&tc_assignment, &assignment_key);
     struct sb_tc_assign_value value;
-    bool assignment_changed = build_assignment(&value, existing, skb->ifindex, source_mac, path, source_mac_valid);
+    __u32 epoch = *(volatile const __u32 *)&control->activity_epoch;
+    bool assignment_changed = build_assignment(&value, existing, skb->ifindex, source_mac, path, source_mac_valid, epoch);
     long result = sk_assign(skb, socket, 0U);
     sk_release(socket);
     if (result != 0) {
@@ -1047,6 +1078,8 @@ NOINLINE int assign_socket_legacy(struct __sk_buff *skb, const struct sb_tc_cont
             return TC_ACT_SHOT;
         }
         bump_assignment_generation();
+    } else {
+        touch_assignment(existing, epoch);
     }
     return TC_ACT_OK;
 }
@@ -1064,7 +1097,8 @@ NOINLINE int assign_udp_socket(struct __sk_buff *skb, const struct sb_tc_control
     assignment_key.interface_index = path == SB_TC_PATH_SHARED ? skb->ifindex : 0U;
     struct sb_tc_assign_value *existing = map_lookup(&tc_assignment, &assignment_key);
     struct sb_tc_assign_value value;
-    bool assignment_changed = build_assignment(&value, existing, skb->ifindex, source_mac, path, source_mac_valid);
+    __u32 epoch = *(volatile const __u32 *)&control->activity_epoch;
+    bool assignment_changed = build_assignment(&value, existing, skb->ifindex, source_mac, path, source_mac_valid, epoch);
     long result = sk_assign(skb, socket, 0U);
     sk_release(socket);
     if (result != 0) {
@@ -1077,6 +1111,8 @@ NOINLINE int assign_udp_socket(struct __sk_buff *skb, const struct sb_tc_control
             return TC_ACT_SHOT;
         }
         bump_assignment_generation();
+    } else {
+        touch_assignment(existing, epoch);
     }
     return TC_ACT_OK;
 }

@@ -145,6 +145,7 @@ func TestSelfBypassModes(t *testing.T) {
 		{SelfBypassUserspace, "userspace_socket_cookie", "socket_storage", false},
 		{SelfBypassCgroupSocket, "cgroup_socket_cookie", "socket_storage", true},
 		{SelfBypassCgroupSocketAddr, "cgroup_socket_addr", "socket_storage", true},
+		{SelfBypassCgroupSocketAddrRelease, "cgroup_socket_addr_release", "socket_storage", true},
 		{SelfBypassUserspaceRelease, "userspace_socket_cookie_release", "socket_storage", false},
 	}
 	for _, test := range tests {

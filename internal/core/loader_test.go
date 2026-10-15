@@ -341,7 +341,7 @@ func TestCgroupReleaseNotificationUsesRingBufferHelper(t *testing.T) {
 
 func TestEmbeddedTCObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadTC, map[string]objectMapLayout{
-		"tc_control":           {4, 76},
+		"tc_control":           {4, 80},
 		"tc_listener_sockets":  {4, 4},
 		"tc_assignment":        {44, 112},
 		"socket_creators":      {4, 64},

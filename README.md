@@ -295,6 +295,52 @@ delivery veth. Any combination of local and shared choices is valid. Shutdown
 detaches each selected backend and removes only routes owned by that instance. A
 disabled path does not load its object or create network state.
 
+## Platform requirements
+
+The library has no universal minimum kernel release. The selected data plane is
+accepted only after its maps, programs, helpers, verifier load, and attachment
+path pass runtime probes; vendor backports and configuration differences make a
+release number alone insufficient.
+
+### Standard Linux and OpenWrt
+
+Use a Linux kernel with BPF syscall support, cgroup v2 when the local
+`cgroup` path is enabled, and the TC classifier facilities required by the
+selected path. Local TC additionally needs a usable veth implementation and
+writable policy-routing and interface sysctls. `packet_rewrite` needs Ethernet
+framing; `socket_assign` can also use the documented raw-IP and tunnel link
+types. Run the probe and service as root or with equivalent capabilities,
+normally `CAP_BPF` and `CAP_NET_ADMIN` (older kernels may also require
+`CAP_SYS_ADMIN`).
+
+On OpenWrt, install kernel modules built for the exact target kernel rather than
+host distribution packages. Depending on the target and data plane these are
+commonly named `kmod-bpf`, `kmod-veth`, `kmod-sched-core`, and the BPF/TC
+classifier module; names vary by release. Confirm that cgroup2 and
+the cgroup2 hierarchy is mounted; bpffs is only needed where pinned netd or
+other pin-based integration is used. The sing-ebpf binary does not require `ip`, `tc`,
+`bpftool`, or libbpf executables at runtime.
+
+### Root Android
+
+Root is necessary but not sufficient. The root service must see a writable
+cgroup v2 hierarchy, Android bpffs/netd pins when coexistence is required, and
+the BPF/TC capabilities granted by the vendor SELinux policy. Android kernels
+commonly restrict cgroup hooks or TCX independently; runtime fallbacks are
+selected separately. A denied optional socket-release or process-tracking hook
+does not by itself make the main data plane unsupported.
+
+Local TC also needs the vendor kernel's veth, TC, route, and sysctl facilities;
+cgroup-only local interception does not need veth or TC. Shared
+`packet_rewrite` requires an Ethernet-framed downstream interface, while
+`socket_assign` supports the documented L3/raw-IP variants. Validate the exact
+device with `sing-box tools ebpf status` and a real startup, recording the build
+fingerprint, kernel configuration, SELinux denials, and selected fallback modes.
+
+The checked-in objects are pure-Go runtime assets: users do not need an Android
+NDK, clang, bpftool, or BTF/CO-RE. Maintainers regenerate them with Android NDK
+r29 Clang 21 and commit both endian variants and the manifest.
+
 ## Building, generation, and tests
 
 This section is the short path for consumers. Developers changing the BPF C,

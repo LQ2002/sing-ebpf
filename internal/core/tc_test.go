@@ -9,7 +9,7 @@ import (
 )
 
 func TestTCABI(t *testing.T) {
-	if size := unsafe.Sizeof(tcControl{}); size != 76 {
+	if size := unsafe.Sizeof(tcControl{}); size != 80 {
 		t.Fatalf("unexpected TC control size: %d", size)
 	}
 	if offset := unsafe.Offsetof(tcControl{}.RoutingMark); offset != 12 {
@@ -41,7 +41,7 @@ func TestTCABI(t *testing.T) {
 		"SocketUID":      {unsafe.Offsetof(TCAssignment{}.SocketUID), 20},
 		"SocketCgroupID": {unsafe.Offsetof(TCAssignment{}.SocketCgroupID), 24},
 		"IdentityFlags":  {unsafe.Offsetof(TCAssignment{}.IdentityFlags), 32},
-		"Reserved":       {unsafe.Offsetof(TCAssignment{}.Reserved), 36},
+		"ActivityEpoch":  {unsafe.Offsetof(TCAssignment{}.ActivityEpoch), 36},
 		"Creator":        {unsafe.Offsetof(TCAssignment{}.Creator), 40},
 		"ChargeUID":      {unsafe.Offsetof(TCAssignment{}.ChargeUID), 104},
 		"ChargeTag":      {unsafe.Offsetof(TCAssignment{}.ChargeTag), 108},

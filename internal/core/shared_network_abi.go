@@ -125,7 +125,19 @@ type SharedPacketRewriteSweepResult struct {
 	Retained uint32
 	Usage    MapUsage
 	Complete bool
+	// UsageKnown is true only after a complete traversal. Failure identifies
+	// the maintenance phase when a pass cannot finish; an empty value also
+	// covers an ordinary partial traversal.
+	UsageKnown bool
+	Failure    string
 }
+
+const (
+	SharedPacketRewriteSweepFailureClosed = "closed"
+	SharedPacketRewriteSweepFailureScan   = "scan"
+	SharedPacketRewriteSweepFailureLookup = "lookup"
+	SharedPacketRewriteSweepFailureDelete = "delete"
+)
 
 const (
 	sharedPacketRewriteFlagIPv4 = 1 << iota

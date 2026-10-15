@@ -194,19 +194,19 @@ int main(void) {
 
     reset();
     record_local_socket_creator(&skb, &key);
-    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_DELIVERY, false));
+    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_DELIVERY, false, 1));
     assert(memcmp(&value.creator, &saved.creator, sizeof(storage)) == 0);
     assert(value.socket_cookie == saved.socket_cookie && value.socket_uid == saved.socket_uid);
     saved = value;
-    assert(!build_assignment(&value, &saved, 9, mac, SB_TC_PATH_DELIVERY, false));
-    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false));
+    assert(!build_assignment(&value, &saved, 9, mac, SB_TC_PATH_DELIVERY, false, 1));
+    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false, 1));
     assert(value.socket_cookie == 0 && value.identity_flags == 0);
     assert(memcmp(&value.creator, &(struct sb_socket_creator){}, sizeof(storage)) == 0);
     saved = value;
     saved.creator = storage; // Creator-only stale data still requires a write.
-    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false));
+    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false, 1));
     saved = value;
-    assert(!build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false));
+    assert(!build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false, 1));
 
     // A netd tag present at the first full-socket packet is copied once; the
     // steady path, a billing UID change and a later retag never look again.
@@ -253,15 +253,25 @@ int main(void) {
     reset();
     charge_present = true;
     record_local_socket_creator(&skb, &key);
-    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_DELIVERY, false));
+    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_DELIVERY, false, 1));
     assert(value.charge_uid == saved.charge_uid && value.charge_tag == saved.charge_tag);
     saved = value;
-    assert(!build_assignment(&value, &saved, 9, mac, SB_TC_PATH_DELIVERY, false));
-    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false));
+    assert(!build_assignment(&value, &saved, 9, mac, SB_TC_PATH_DELIVERY, false, 1));
+    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false, 1));
     assert(value.charge_uid == 0 && value.charge_tag == 0);
     saved = value;
     saved.charge_tag = 1; // Charge-only stale data on a shared entry.
-    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false));
+    assert(build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false, 1));
+
+    // The activity period is stamped into new values but is not a change:
+    // a later period alone must not rewrite the entry (touch_assignment
+    // stamps it in place instead).
+    saved = value;
+    assert(value.activity_epoch == 1);
+    assert(!build_assignment(&value, &saved, 9, mac, SB_TC_PATH_SHARED, false, 2));
+    assert(value.activity_epoch == 2);
+    touch_assignment(&saved, 2);
+    assert(saved.activity_epoch == 2);
 
     reset();
     charge_present = true;

@@ -21,8 +21,11 @@ import (
 )
 
 const (
-	selfBypassSocketCapacity        = 65536
-	CompactSelfBypassSocketCapacity = 16384
+	// Socket-cookie entries are short-lived runtime state. The LRU fallback
+	// bounds stale entries, so use a smaller default while retaining room for
+	// normal concurrent sockets.
+	selfBypassSocketCapacity        = 16384
+	CompactSelfBypassSocketCapacity = 8192
 )
 
 // SelfBypass owns the socket-cookie map used by the local TC classifier. The
@@ -48,6 +51,10 @@ const (
 	SelfBypassUserspace SelfBypassMode = iota
 	SelfBypassCgroupSocket
 	SelfBypassCgroupSocketAddr
+	// SelfBypassCgroupSocketAddrRelease combines socket-address marking with
+	// sock_release cleanup. The release hook is best-effort because vendor
+	// kernels may reject it while accepting the address hooks.
+	SelfBypassCgroupSocketAddrRelease
 	// SelfBypassUserspaceRelease keeps userspace socket registration while
 	// using a cgroup sock_release hook for lifecycle cleanup. This is useful
 	// when socket-create/connect hooks are unavailable, including TC-only
@@ -61,6 +68,8 @@ func (m SelfBypassMode) String() string {
 		return "cgroup_socket_cookie"
 	case SelfBypassCgroupSocketAddr:
 		return "cgroup_socket_addr"
+	case SelfBypassCgroupSocketAddrRelease:
+		return "cgroup_socket_addr_release"
 	case SelfBypassUserspaceRelease:
 		return "userspace_socket_cookie_release"
 	default:
@@ -197,6 +206,11 @@ func (b *SelfBypass) AttachCgroup(config SelfBypassCgroupConfig) error {
 		}
 		socketAddrErr := b.attachCgroupSocketAddr(cgroupPath, config)
 		if socketAddrErr == nil {
+			// Upstream pairs the address hooks with a sock_release hook here
+			// (SelfBypassCgroupSocketAddrRelease) so LRU entries are deleted on
+			// close. Socket local storage is freed with its socket, so in this
+			// fork that hook would only add a program run to every socket
+			// release in the cgroup.
 			b.mode.Store(uint32(SelfBypassCgroupSocketAddr))
 			return nil
 		}
@@ -225,7 +239,7 @@ func (b *SelfBypass) CgroupAttached() bool {
 		return false
 	}
 	mode := SelfBypassMode(b.mode.Load())
-	return mode == SelfBypassCgroupSocket || mode == SelfBypassCgroupSocketAddr
+	return mode == SelfBypassCgroupSocket || mode == SelfBypassCgroupSocketAddr || mode == SelfBypassCgroupSocketAddrRelease
 }
 
 func (b *SelfBypass) Mode() SelfBypassMode {
@@ -276,8 +290,8 @@ func (b *SelfBypass) attachCgroupRelease(path string) error {
 		_ = program.Close()
 		return E.Cause(err, "attach eBPF self-bypass socket-release cleanup hook")
 	}
-	b.programs = []*CiliumEBPF.Program{program}
-	b.links = []cgroupProgramLink{programLink}
+	b.programs = append(b.programs, program)
+	b.links = append(b.links, programLink)
 	return nil
 }
 
@@ -498,7 +512,10 @@ func (b *SelfBypass) UnregisterSocket(rawConn syscall.RawConn) error {
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
-	if b.sockets == nil || b.CgroupAttached() {
+	// Every mode frees the entry with the socket. Skip the delete syscall
+	// where a hook already does it at release (CgroupSocket, UserspaceRelease)
+	// or where hooks own the registration (CgroupSocketAddr).
+	if mode := b.Mode(); b.sockets == nil || b.CgroupAttached() || mode == SelfBypassUserspaceRelease {
 		return nil
 	}
 	err := control.Raw(rawConn, func(fd uintptr) error {
