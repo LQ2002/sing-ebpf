@@ -30,13 +30,15 @@ const (
 )
 
 type tcPolicyRouting struct {
-	lock     io.Closer
-	mark     uint32
-	table    int
-	priority int
-	families []int
-	routes   []netlink.Route
-	rules    []*netlink.Rule
+	lock io.Closer
+	// reclaimed counts leftover rule sets of dead runtimes removed at start.
+	reclaimed int
+	mark      uint32
+	table     int
+	priority  int
+	families  []int
+	routes    []netlink.Route
+	rules     []*netlink.Rule
 }
 
 type tcStalePolicyRouting struct {
@@ -74,6 +76,11 @@ func startTCPolicyRouting(enableIPv6 bool) (*tcPolicyRouting, error) {
 		families = append(families, unix.AF_INET6)
 	}
 	routing.families = families
+	reclaimed, err := reclaimLeftoverTCPolicyRouting(loopback.Attrs().Index)
+	if err != nil {
+		return cleanup(err)
+	}
+	routing.reclaimed = reclaimed
 	identifiers, err := allocateTCPolicyIdentifiers(loopback.Attrs().Index, families)
 	if err != nil {
 		return cleanup(err)
@@ -532,26 +539,58 @@ func listTCPolicyRules(family int, expected netlink.Rule) ([]tcPolicyRuleEntry, 
 // sentinel has to survive a conversion to int — the reason a high-bit option
 // cannot be mistaken for "absent" on a 32-bit build.
 func parseTCPolicyRuleMessage(message []byte, expected netlink.Rule) (tcPolicyRuleEntry, bool, error) {
+	shape, ok, err := parseTCPolicyRuleShape(message)
+	if err != nil || !ok {
+		return tcPolicyRuleEntry{}, ok, err
+	}
+	entry := tcPolicyRuleEntry{priority: shape.priority, table: shape.table}
+	entry.owned = shape.plain &&
+		shape.family == expected.Family &&
+		entry.priority == expected.Priority &&
+		entry.table == expected.Table &&
+		shape.mark == int64(expected.Mark) &&
+		shape.mask == int64(expected.Mask)
+	return entry, true, nil
+}
+
+// tcPolicyRuleShape is what one RTM_NEWRULE message says about a rule. plain
+// reports that the rule carries the action, the selector and the attributes
+// this process installs, and nothing else; the concrete values are compared by
+// the callers.
+type tcPolicyRuleShape struct {
+	family   int
+	priority int
+	table    int
+	mark     int64
+	mask     int64
+	plain    bool
+}
+
+func parseTCPolicyRuleShape(message []byte) (tcPolicyRuleShape, bool, error) {
 	if len(message) < unix.SizeofRtMsg {
-		return tcPolicyRuleEntry{}, false, nil
+		return tcPolicyRuleShape{}, false, nil
 	}
 	native := nl.NativeEndian()
 	header := nl.DeserializeRtMsg(message)
 	attributes, err := nl.ParseRouteAttr(message[header.Len():])
 	if err != nil {
-		return tcPolicyRuleEntry{}, false, err
+		return tcPolicyRuleShape{}, false, err
 	}
-	entry := tcPolicyRuleEntry{priority: -1, table: int(header.Table)}
-	owned := int(header.Family) == expected.Family &&
-		header.Type == nl.FR_ACT_TO_TBL &&
+	shape := tcPolicyRuleShape{
+		family:   int(header.Family),
+		priority: -1,
+		table:    int(header.Table),
+		mark:     -1,
+		mask:     -1,
+	}
+	plain := header.Type == nl.FR_ACT_TO_TBL &&
 		header.Flags&netlink.FibRuleInvert == 0 &&
 		header.Tos == 0 && header.Src_len == 0 && header.Dst_len == 0
-	var mark, mask int64 = -1, -1
 	// The attributes read below are 32-bit; a short one is malformed and reading
 	// it would be out of bounds, so it disowns the rule instead.
 	word := func(value []byte) (uint32, bool) {
 		if len(value) < 4 {
-			owned = false
+			plain = false
 			return 0, false
 		}
 		return native.Uint32(value[:4]), true
@@ -564,37 +603,112 @@ func parseTCPolicyRuleMessage(message []byte, expected netlink.Rule) (tcPolicyRu
 			// a word, so it is deliberately not length-checked here.
 		case unix.RTA_TABLE:
 			if table, ok := word(value); ok {
-				entry.table = int(table)
+				shape.table = int(table)
 			}
 		case nl.FRA_PRIORITY:
 			if priority, ok := word(value); ok {
-				entry.priority = int(priority)
+				shape.priority = int(priority)
 			}
 		case nl.FRA_FWMARK:
 			if fwmark, ok := word(value); ok {
-				mark = int64(fwmark)
+				shape.mark = int64(fwmark)
 			}
 		case nl.FRA_FWMASK:
 			if fwmask, ok := word(value); ok {
-				mask = int64(fwmask)
+				shape.mask = int64(fwmask)
 			}
 		case nl.FRA_SUPPRESS_PREFIXLEN, nl.FRA_SUPPRESS_IFGROUP:
 			// Emitted for every rule whether or not suppression is configured, so
 			// presence means nothing and the value has to be read: anything other
 			// than the all-ones sentinel is a real suppression setting.
 			if suppress, ok := word(value); ok && suppress != ^uint32(0) {
-				owned = false
+				plain = false
 			}
 		default:
-			owned = false
+			plain = false
 		}
 	}
-	entry.owned = owned &&
-		entry.priority == expected.Priority &&
-		entry.table == expected.Table &&
-		mark == int64(expected.Mark) &&
-		mask == int64(expected.Mask)
-	return entry, true, nil
+	shape.plain = plain
+	return shape, true, nil
+}
+
+// leftoverTCPolicyMark reports whether a rule has the exact form a sing-ebpf
+// runtime installs for its TC routing mark: plain, one fwmark bit with the
+// same mask (selectTCPolicyMark never picks bit 31), and a priority and table
+// from the ranges allocateTCPolicyIdentifiers draws from.
+func leftoverTCPolicyMark(shape tcPolicyRuleShape) bool {
+	if !shape.plain || shape.mark <= 0 || shape.mark != shape.mask {
+		return false
+	}
+	mark := uint32(shape.mark)
+	if mark&(mark-1) != 0 || mark > 1<<30 {
+		return false
+	}
+	return shape.priority >= tcPolicyPriorityMin && shape.priority <= tcPolicyPriorityMax &&
+		shape.table >= tcPolicyTableMin && shape.table <= tcPolicyTableMax
+}
+
+// reclaimLeftoverTCPolicyRouting removes the policy rules and local routes of
+// sing-ebpf runtimes that died without closing them. It must only run while
+// this process holds the policy-routing lock: with the lock held no other
+// runtime in this network namespace manages TC policy routing, so every rule
+// of exactly our form whose table holds exactly our loopback routes can only
+// be left over.
+//
+// Without this, a killed runtime's rule kept its mark bit, the next runtime
+// chose another bit (the preferred-identifier reuse above compares against
+// DefaultTCRoutingMark, 1<<29, while selectTCPolicyMark hands out 1<<30
+// first, so it never matched in practice), and after the 12 free bits of a
+// device were used up no runtime could start: on 2026-10-17 a phone reached
+// "no unused TC eBPF routing mark is available" after a series of killed
+// sing-box instances (priorities 8999-9010, tables 2027-2038).
+func reclaimLeftoverTCPolicyRouting(loopbackIndex int) (int, error) {
+	reclaimed := 0
+	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
+		request := nl.NewNetlinkRequest(unix.RTM_GETRULE, unix.NLM_F_DUMP|unix.NLM_F_REQUEST)
+		request.AddData(nl.NewIfInfomsg(family))
+		messages, err := request.Execute(unix.NETLINK_ROUTE, unix.RTM_NEWRULE)
+		if err != nil {
+			if family == unix.AF_INET6 && (errors.Is(err, unix.EAFNOSUPPORT) || errors.Is(err, unix.EOPNOTSUPP)) {
+				continue
+			}
+			return reclaimed, E.Cause(err, "inspect leftover TC eBPF policy rules")
+		}
+		for _, message := range messages {
+			shape, ok, parseErr := parseTCPolicyRuleShape(message)
+			if parseErr != nil {
+				return reclaimed, E.Cause(parseErr, "inspect leftover TC eBPF policy rules")
+			}
+			if !ok || shape.family != family || !leftoverTCPolicyMark(shape) {
+				continue
+			}
+			routes, routeErr := netlink.RouteListFiltered(family, &netlink.Route{Table: shape.table}, netlink.RT_FILTER_TABLE)
+			if routeErr != nil {
+				return reclaimed, E.Cause(routeErr, "inspect leftover TC eBPF routing table")
+			}
+			expectedRoutes := tcPolicyRoutesForTable(loopbackIndex, family, shape.table)
+			foreign := false
+			for _, route := range routes {
+				if !matchesTCPolicyRoute(route, expectedRoutes) {
+					foreign = true
+					break
+				}
+			}
+			if foreign {
+				// Same rule form but a table with someone else's routes: not ours.
+				continue
+			}
+			stale := tcStalePolicyRouting{
+				rule:   tcPolicyRuleFor(family, uint32(shape.mark), shape.table, shape.priority),
+				routes: routes,
+			}
+			if err = removeStaleTCPolicyRouting(stale); err != nil {
+				return reclaimed, err
+			}
+			reclaimed++
+		}
+	}
+	return reclaimed, nil
 }
 
 func tcPolicyDeleteIgnored(err error) bool {

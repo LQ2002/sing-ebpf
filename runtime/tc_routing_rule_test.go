@@ -395,3 +395,51 @@ func TestParseTCPolicyRuleMessageAcceptsCrashLeftover(t *testing.T) {
 		}
 	}
 }
+
+// TestLeftoverTCPolicyMark covers which rules startup may reclaim as left over
+// by a dead runtime: exactly our form with any one-bit mark, priority and
+// table from our ranges, and nothing broader.
+func TestLeftoverTCPolicyMark(t *testing.T) {
+	shapeOf := func(t *testing.T, header nl.RtMsg, attributes []tcTestRuleAttribute) tcPolicyRuleShape {
+		t.Helper()
+		shape, ok, err := parseTCPolicyRuleShape(tcTestRuleMessage(header, attributes))
+		if err != nil || !ok {
+			t.Fatalf("parse: ok=%v err=%v", ok, err)
+		}
+		return shape
+	}
+	own := tcTestOwnRuleAttributes()
+	withMark := func(mark uint32) []tcTestRuleAttribute {
+		return tcTestReplaceAttribute(tcTestReplaceAttribute(own, nl.FRA_FWMARK, mark), nl.FRA_FWMASK, mark)
+	}
+	for _, testCase := range []struct {
+		name       string
+		header     nl.RtMsg
+		attributes []tcTestRuleAttribute
+		leftover   bool
+	}{
+		{"our own identifiers", tcTestOwnRuleHeader(unix.AF_INET), own, true},
+		{"the second allocated set", tcTestOwnRuleHeader(unix.AF_INET), tcTestReplaceAttribute(tcTestReplaceAttribute(withMark(1<<29), unix.RTA_TABLE, 2028), nl.FRA_PRIORITY, 9000), true},
+		{"lowest bit", tcTestOwnRuleHeader(unix.AF_INET6), withMark(1), true},
+		{"bit 31 is never allocated", tcTestOwnRuleHeader(unix.AF_INET), withMark(1 << 31), false},
+		{"several mark bits", tcTestOwnRuleHeader(unix.AF_INET), withMark(3 << 20), false},
+		{"mask wider than mark", tcTestOwnRuleHeader(unix.AF_INET), tcTestReplaceAttribute(own, nl.FRA_FWMASK, 0xffff0000), false},
+		{"no mark", tcTestOwnRuleHeader(unix.AF_INET), tcTestRemoveAttribute(tcTestRemoveAttribute(own, nl.FRA_FWMARK), nl.FRA_FWMASK), false},
+		{"priority below range", tcTestOwnRuleHeader(unix.AF_INET), tcTestReplaceAttribute(own, nl.FRA_PRIORITY, tcPolicyPriorityMin-1), false},
+		{"priority above range", tcTestOwnRuleHeader(unix.AF_INET), tcTestReplaceAttribute(own, nl.FRA_PRIORITY, tcPolicyPriorityMax+1), false},
+		{"table below range", tcTestOwnRuleHeader(unix.AF_INET), tcTestReplaceAttribute(own, unix.RTA_TABLE, tcPolicyTableMin-1), false},
+		{"extra condition", tcTestOwnRuleHeader(unix.AF_INET), append(own, tcTestUint32Attribute(3 /* FRA_IIFNAME */, 0x6f6c)), false},
+		{"suppression set", tcTestOwnRuleHeader(unix.AF_INET), tcTestReplaceAttribute(own, nl.FRA_SUPPRESS_PREFIXLEN, 0), false},
+		{"not a table action", func() nl.RtMsg {
+			header := tcTestOwnRuleHeader(unix.AF_INET)
+			header.Type = nl.FR_ACT_BLACKHOLE
+			return header
+		}(), own, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := leftoverTCPolicyMark(shapeOf(t, testCase.header, testCase.attributes)); got != testCase.leftover {
+				t.Fatalf("leftover = %v, want %v", got, testCase.leftover)
+			}
+		})
+	}
+}
