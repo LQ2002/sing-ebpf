@@ -70,6 +70,27 @@ func TestProcessTrackerInstructions(t *testing.T) {
 	}
 }
 
+func TestProcessTrackerUIDUsesClassicNetworkByteOrder(t *testing.T) {
+	instructions := processTrackerInstructions(1, 2, 3, false)
+	var conversions int
+	for _, instruction := range instructions {
+		if instruction.OpCode == asm.BSwap(asm.R0, asm.Word).OpCode {
+			t.Fatal("UID policy requires an ISA v4 unconditional swap")
+		}
+		if instruction.OpCode == asm.HostTo(asm.BE, asm.R0, asm.Word).OpCode && instruction.Constant == 32 {
+			conversions++
+		}
+	}
+	if conversions != 1 {
+		t.Fatalf("UID network-order conversions = %d, want 1", conversions)
+	}
+	for _, order := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		if err := instructions.Marshal(new(bytes.Buffer), order); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestProcessTrackerReleaseInstructions(t *testing.T) {
 	for _, test := range []struct {
 		name       string

@@ -299,7 +299,9 @@ func processTrackerInstructions(ownerMapFD, policyUIDMapFD, metadataMapFD int, d
 		asm.Ja.Label("lookup_policy_uid"),
 		asm.StoreImm(asm.RFP, -28, 0, asm.Word).WithSymbol("metadata_empty"),
 		asm.LoadMem(asm.R0, asm.RFP, -12, asm.Word).WithSymbol("lookup_policy_uid"),
-		asm.BSwap(asm.R0, asm.Word),
+		// UID trie keys are network-order, not unconditionally byte-swapped.
+		// The classic END instruction also works before BPF ISA v4.
+		asm.HostTo(asm.BE, asm.R0, asm.Word),
 		asm.StoreMem(asm.RFP, -20, asm.R0, asm.Word),
 		asm.LoadMapPtr(asm.R1, policyUIDMapFD),
 		asm.Mov.Reg(asm.R2, asm.RFP),
