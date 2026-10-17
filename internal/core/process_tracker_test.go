@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	CiliumEBPF "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 	"golang.org/x/sys/unix"
 )
 
@@ -70,12 +71,37 @@ func TestProcessTrackerInstructions(t *testing.T) {
 }
 
 func TestProcessTrackerReleaseInstructions(t *testing.T) {
-	instructions := processTrackerReleaseInstructions(1)
-	if len(instructions) == 0 {
-		t.Fatal("empty process tracker release instructions")
-	}
-	if err := instructions.Marshal(new(bytes.Buffer), binary.LittleEndian); err != nil {
-		t.Fatal(err)
+	for _, test := range []struct {
+		name       string
+		metadataFD int
+		deletes    int
+	}{
+		{"owner_only", -1, 1},
+		{"with_policy_metadata", 2, 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			instructions := processTrackerReleaseInstructions(1, test.metadataFD)
+			var cookies, deletes int
+			for _, instruction := range instructions {
+				if !instruction.IsBuiltinCall() {
+					continue
+				}
+				switch asm.BuiltinFunc(instruction.Constant) {
+				case asm.FnGetSocketCookie:
+					cookies++
+				case asm.FnMapDeleteElem:
+					deletes++
+				}
+			}
+			if cookies != 1 || deletes != test.deletes {
+				t.Fatalf("release calls: cookies=%d deletes=%d, want 1/%d", cookies, deletes, test.deletes)
+			}
+			for _, order := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+				if err := instructions.Marshal(new(bytes.Buffer), order); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

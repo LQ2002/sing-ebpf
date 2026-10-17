@@ -28,9 +28,10 @@ const (
 	CompactSelfBypassSocketCapacity = 8192
 )
 
-// SelfBypass owns the socket-cookie map used by the local TC classifier. The
-// map is populated by cgroup hooks when the process has an exclusive cgroup,
-// or by the socket control callback when cgroup attachment is unavailable.
+// SelfBypass owns the socket-cookie metadata map used by the local TC classifier.
+// Self-bypass flags are populated by process cgroup hooks or socket controls.
+// ProcessTracker may also write application UID policy flags into this map;
+// those entries require the tracker's wider cgroup release coverage.
 type SelfBypass struct {
 	access   sync.RWMutex
 	sockets  *CiliumEBPF.Map
@@ -427,18 +428,29 @@ func selfBypassReleaseInstructions(mapFD int) asm.Instructions {
 	}
 }
 
-func socketCookieDeleteInstructions(mapFD int) asm.Instructions {
-	return asm.Instructions{
+func socketCookieDeleteInstructions(mapFDs ...int) asm.Instructions {
+	instructions := asm.Instructions{
 		asm.FnGetSocketCookie.Call(),
 		asm.JEq.Imm(asm.R0, 0, "allow"),
 		asm.StoreMem(asm.RFP, -8, asm.R0, asm.DWord),
-		asm.LoadMapPtr(asm.R1, mapFD),
-		asm.Mov.Reg(asm.R2, asm.RFP),
-		asm.Add.Imm(asm.R2, -8),
-		asm.FnMapDeleteElem.Call(),
+	}
+	for _, mapFD := range mapFDs {
+		if mapFD < 0 {
+			continue
+		}
+		// Maps can evict independently. A missing entry in one must not skip
+		// cleanup of the same cookie in the others.
+		instructions = append(instructions,
+			asm.LoadMapPtr(asm.R1, mapFD),
+			asm.Mov.Reg(asm.R2, asm.RFP),
+			asm.Add.Imm(asm.R2, -8),
+			asm.FnMapDeleteElem.Call(),
+		)
+	}
+	return append(instructions,
 		asm.Mov.Imm(asm.R0, 1).WithSymbol("allow"),
 		asm.Return(),
-	}
+	)
 }
 
 // sockAddrSocketOffset is offsetof(struct bpf_sock_addr, sk) from the kernel

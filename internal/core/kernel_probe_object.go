@@ -149,7 +149,7 @@ func loadProcessTrackerProbeObject(plan kernelProbePlan) (string, error) {
 		}
 		programs = append(programs, program)
 	}
-	release, loadErr := newProcessTrackerReleaseProgram(owners.FD())
+	release, loadErr := newProcessTrackerReleaseProgram(owners.FD(), -1)
 	if loadErr != nil {
 		return "Loads the process-tracking hooks without attaching them.", errors.Join(loadErr, closePrograms())
 	}

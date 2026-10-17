@@ -165,14 +165,19 @@ and performs direct `bpf_skc_lookup_tcp` lookup. UDP lookup substitutes only the
 internal listener port. `tc_assignment` records the original tuple, ingress
 interface, shared source MAC, packet path, and (for local process matching) the
 socket cookie used to recover the process owner. The separate
-`tc_self_sockets` map contains only cookies of consumer-owned sockets and is
-consulted by local egress before any packet interception.
+`tc_self_sockets` map (shared as `sb_self_sockets`) contains consumer self-bypass
+flags and, when UID policy tracking is enabled, application socket policy flags.
+Local egress checks the self-bypass bit before interception and uses the policy
+bits when evaluating UID decisions. CIDR bypass rules do not populate this map.
 The optional cgroup socket-address tracker records cookie, PID, and UID in a
 bounded LRU map. Userspace then reads only `/proc/<pid>/exe` instead of scanning
 all process file descriptors. If the tracker cannot be attached, normal route
-process search remains the fallback. A cgroup `sock_release` hook removes owner
-records immediately when supported; otherwise the bounded LRU map remains the
-cleanup fallback. Its capability probe is multi-only and does not displace an
+process search remains the fallback. The tracker's root-cgroup `sock_release`
+hook removes both owner records and any UID policy metadata for the released
+cookie. The consumer's narrower self-bypass release hook cannot clean up sockets
+created by applications outside its cgroup. When the tracker release hook is
+unavailable, both maps retain bounded LRU fallback, so occupancy can remain high
+after sockets close. Its capability probe is multi-only and does not displace an
 existing cgroup owner.
 Raw-IP shared links mark the source MAC as unavailable rather than publishing a
 synthetic address. Source MAC policy therefore requires Ethernet framing.
