@@ -74,6 +74,8 @@ static __s64 (*csum_diff)(const __be32 *from, __u32 from_size, const __be32 *to,
 static long (*skb_pull_data)(struct __sk_buff *skb, __u32 length) = (void *)BPF_FUNC_skb_pull_data;
 static long (*skb_store_bytes)(struct __sk_buff *skb, __u32 offset, const void *from, __u32 length, __u64 flags) =
     (void *)BPF_FUNC_skb_store_bytes;
+static long (*skb_load_bytes)(const struct __sk_buff *skb, __u32 offset, void *to, __u32 length) =
+    (void *)BPF_FUNC_skb_load_bytes;
 static long (*l3_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, __u64 to, __u64 flags) =
     (void *)BPF_FUNC_l3_csum_replace;
 static long (*l4_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, __u64 to, __u64 flags) =

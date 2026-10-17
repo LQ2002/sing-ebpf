@@ -14,6 +14,24 @@ INLINE __u64 pseudo_header_checksum_flags(__u8 protocol, __u64 size) {
 	return checksum_flags(protocol, size) | BPF_F_PSEUDO_HDR;
 }
 
+// A zero IPv4 UDP checksum can mean either "checksum disabled" or a zero
+// CHECKSUM_PARTIAL pseudo-header seed. __sk_buff does not expose ip_summed.
+// A non-pseudo-header adjustment is ignored for CHECKSUM_PARTIAL, so probe
+// with a nonzero delta and immediately restore the field. This preserves both
+// meanings without reading kernel-private skb fields or completing checksums
+// in software. Only the zero-checksum slow path needs these extra helpers.
+INLINE int ipv4_udp_checksum_disabled(struct __sk_buff *skb, __u32 offset) {
+    __u16 checksum;
+    if (skb_load_bytes(skb, offset, &checksum, sizeof(checksum)) != 0) return -1;
+    if (checksum != 0U) return 0;
+    if (l4_csum_replace(skb, offset, 0U, 1U, 2U) != 0 ||
+        skb_load_bytes(skb, offset, &checksum, sizeof(checksum)) != 0) return -1;
+    if (checksum == 0U) return 0;
+    checksum = 0U;
+    if (skb_store_bytes(skb, offset, &checksum, sizeof(checksum), 0U) != 0) return -1;
+    return 1;
+}
+
 INLINE int rewrite_ipv4(
     struct __sk_buff *skb,
     __u32 l3_offset,
@@ -31,6 +49,9 @@ INLINE int rewrite_ipv4(
 	__u32 checksum_offset = l4_offset + (protocol == IPPROTO_TCP_VALUE
 		? __builtin_offsetof(struct tcp_header_min, checksum)
 		: __builtin_offsetof(struct udp_header_min, checksum));
+	int checksum_disabled = protocol == IPPROTO_UDP_VALUE
+		? ipv4_udp_checksum_disabled(skb, checksum_offset) : 0;
+	if (checksum_disabled < 0) { record_rewrite_failure(); return TC_ACT_SHOT; }
 	__s64 address_diff = csum_diff(&old_address, 4U, &new_address, 4U, 0U);
 	if (address_diff < 0) { record_rewrite_failure(); return TC_ACT_SHOT; }
 	if (l3_csum_replace(
@@ -42,8 +63,9 @@ INLINE int rewrite_ipv4(
 		record_rewrite_failure();
 		return TC_ACT_SHOT;
 	}
-	if (l4_csum_replace(skb, checksum_offset, 0U, (__u64)address_diff, pseudo_header_checksum_flags(protocol, 0U)) != 0 ||
-		l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U)) != 0 ||
+	if ((!checksum_disabled &&
+		(l4_csum_replace(skb, checksum_offset, 0U, (__u64)address_diff, pseudo_header_checksum_flags(protocol, 0U)) != 0 ||
+		 l4_csum_replace(skb, checksum_offset, old_port, new_port, checksum_flags(protocol, 2U)) != 0)) ||
         skb_store_bytes(skb, address_offset, &new_address, sizeof(new_address), 0U) != 0 ||
         skb_store_bytes(skb, port_offset, &new_port, sizeof(new_port), 0U) != 0) {
         record_rewrite_failure();
