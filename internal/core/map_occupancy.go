@@ -49,21 +49,21 @@ type mapMetadata struct {
 }
 
 var configuredPolicyMapMetadata = map[string]mapMetadata{
-	"sb_cg_bypass_port": {category: MapCategoryConfiguredPolicy},
-	"sb_cg_uid":         {category: MapCategoryConfiguredPolicy},
-	"sb_proc_uid":       {category: MapCategoryConfiguredPolicy},
-	"sb_tc_uid":         {category: MapCategoryConfiguredPolicy},
-	"sb_tc_insrc4":      {category: MapCategoryConfiguredPolicy},
-	"sb_tc_insrc6":      {category: MapCategoryConfiguredPolicy},
-	"sb_tc_exsrc4":      {category: MapCategoryConfiguredPolicy},
-	"sb_tc_exsrc6":      {category: MapCategoryConfiguredPolicy},
-	"sb_tc_insmac":      {category: MapCategoryConfiguredPolicy},
-	"sb_tc_exsmac":      {category: MapCategoryConfiguredPolicy},
-	"sb_tc_lport":       {category: MapCategoryConfiguredPolicy},
-	"sb_tc_sport":       {category: MapCategoryConfiguredPolicy},
-	"sb_sh_inmac":       {category: MapCategoryConfiguredPolicy},
-	"sb_sh_exmac":       {category: MapCategoryConfiguredPolicy},
-	"sb_sh_port":        {category: MapCategoryConfiguredPolicy},
+	"sb_cg_byp_port": {category: MapCategoryConfiguredPolicy},
+	"sb_cg_uid":      {category: MapCategoryConfiguredPolicy},
+	"sb_proc_uid":    {category: MapCategoryConfiguredPolicy},
+	"sb_tc_uid":      {category: MapCategoryConfiguredPolicy},
+	"sb_tc_insrc4":   {category: MapCategoryConfiguredPolicy},
+	"sb_tc_insrc6":   {category: MapCategoryConfiguredPolicy},
+	"sb_tc_exsrc4":   {category: MapCategoryConfiguredPolicy},
+	"sb_tc_exsrc6":   {category: MapCategoryConfiguredPolicy},
+	"sb_tc_insmac":   {category: MapCategoryConfiguredPolicy},
+	"sb_tc_exsmac":   {category: MapCategoryConfiguredPolicy},
+	"sb_tc_lport":    {category: MapCategoryConfiguredPolicy},
+	"sb_tc_sport":    {category: MapCategoryConfiguredPolicy},
+	"sb_sh_inmac":    {category: MapCategoryConfiguredPolicy},
+	"sb_sh_exmac":    {category: MapCategoryConfiguredPolicy},
+	"sb_sh_port":     {category: MapCategoryConfiguredPolicy},
 }
 
 func metadataForMapName(name string) mapMetadata {
